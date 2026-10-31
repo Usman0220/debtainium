@@ -1,12 +1,15 @@
 """
-Debtainium GTK4 + Libadwaita Graphical Interface
-Provides an Obtainium-style desktop interface for tracking, checking,
-downloading, and installing .deb packages from GitHub Releases.
+Debtainium GTK4 + Libadwaita Graphical Interface (Verbose & Enhanced)
+Provides a rich, detailed desktop interface with interactive expander rows,
+live real-time activity log drawer, repository inspector preview, status summary,
+and full package lifecycle management.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -16,7 +19,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk
+gi.require_version("Gio", "2.0")
+from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 from debtainium.core import (
     APP_VERSION,
@@ -39,21 +43,23 @@ from debtainium.core import (
     normalize_repo,
     pick_release_asset,
     save_apps,
+    uninstall_deb_package,
     verify_file_sha256,
 )
 
 
 class DebtainiumWindow(Adw.ApplicationWindow):
-    """Main application window for Debtainium."""
+    """Main application window with verbose inspector and activity console."""
 
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title="Debtainium")
-        self.set_default_size(780, 580)
+        self.set_default_size(860, 680)
 
         self.apps: List[AppEntry] = []
         self.is_busy = False
+        self.search_filter_text = ""
 
-        # Toast overlay as root content
+        # Toast overlay
         self.toast_overlay = Adw.ToastOverlay()
         self.set_content(self.toast_overlay)
 
@@ -65,55 +71,110 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.header_bar = Adw.HeaderBar()
         title_widget = Adw.WindowTitle(
             title="Debtainium",
-            subtitle=f"GitHub .deb Manager (arch: {get_system_arch()})"
+            subtitle=f"GitHub .deb Manager • {get_system_arch()}"
         )
         self.header_bar.set_title_widget(title_widget)
 
-        # Header buttons
+        # Start Header Buttons
         self.add_btn = Gtk.Button.new_from_icon_name("list-add-symbolic")
-        self.add_btn.set_tooltip_text("Add Application")
+        self.add_btn.set_tooltip_text("Add Application from GitHub")
         self.add_btn.connect("clicked", self.on_add_clicked)
         self.header_bar.pack_start(self.add_btn)
 
+        # End Header Buttons
         self.refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
-        self.refresh_btn.set_tooltip_text("Check All for Updates")
+        self.refresh_btn.set_tooltip_text("Check All Tracked Apps for Updates")
         self.refresh_btn.connect("clicked", self.on_check_all_clicked)
         self.header_bar.pack_end(self.refresh_btn)
 
+        self.log_toggle_btn = Gtk.ToggleButton.new()
+        self.log_toggle_btn.set_icon_name("utilities-terminal-symbolic")
+        self.log_toggle_btn.set_tooltip_text("Toggle Real-Time Activity Log")
+        self.log_toggle_btn.set_active(True)
+        self.log_toggle_btn.connect("toggled", self.on_toggle_log)
+        self.header_bar.pack_end(self.log_toggle_btn)
+
         self.toolbar_view.add_top_bar(self.header_bar)
 
-        # Content Box
-        self.content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.toolbar_view.set_content(self.content_box)
+        # Main vertical content split
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.toolbar_view.set_content(self.main_box)
 
-        # Progress bar
+        # Progress reporting banner
+        self.progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.progress_box.set_margin_start(16)
+        self.progress_box.set_margin_end(16)
+        self.progress_box.set_margin_top(8)
+        self.progress_box.set_margin_bottom(4)
+        self.progress_box.set_visible(False)
+
+        self.progress_label = Gtk.Label(label="Working...")
+        self.progress_label.set_halign(Gtk.Align.START)
+        self.progress_label.add_css_class("caption")
+        self.progress_box.append(self.progress_label)
+
         self.progress_bar = Gtk.ProgressBar()
-        self.progress_bar.set_visible(False)
-        self.content_box.append(self.progress_bar)
+        self.progress_bar.set_show_text(False)
+        self.progress_box.append(self.progress_bar)
+        self.main_box.append(self.progress_box)
 
-        # Scrolled container for apps
-        self.scrolled = Gtk.ScrolledWindow()
-        self.scrolled.set_vexpand(True)
-        self.scrolled.set_hexpand(True)
-        self.content_box.append(self.scrolled)
+        # Dashboard Summary Bar
+        self.summary_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.summary_box.set_margin_start(16)
+        self.summary_box.set_margin_end(16)
+        self.summary_box.set_margin_top(10)
+        self.summary_box.set_margin_bottom(6)
+        self.summary_box.set_halign(Gtk.Align.FILL)
 
-        self.clamp = Adw.Clamp(maximum_size=750, tightening_threshold=550)
-        self.clamp.set_margin_top(16)
-        self.clamp.set_margin_bottom(16)
+        self.total_chip = self.create_summary_chip("📦 Total Tracked", "0")
+        self.updates_chip = self.create_summary_chip("🔄 Updates Available", "0", accent=True)
+        self.uptodate_chip = self.create_summary_chip("✅ Up to Date", "0", success=True)
+        self.arch_chip = self.create_summary_chip("💻 System Arch", get_system_arch())
+
+        self.summary_box.append(self.total_chip["box"])
+        self.summary_box.append(self.updates_chip["box"])
+        self.summary_box.append(self.uptodate_chip["box"])
+        self.summary_box.append(self.arch_chip["box"])
+        self.main_box.append(self.summary_box)
+
+        # Search Bar
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Filter by name, repo, package name, or status...")
+        self.search_entry.set_margin_start(16)
+        self.search_entry.set_margin_end(16)
+        self.search_entry.set_margin_bottom(8)
+        self.search_entry.connect("search-changed", self.on_search_changed)
+        self.main_box.append(self.search_entry)
+
+        # Paned container: Apps list on top, Activity Log drawer on bottom
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.paned.set_vexpand(True)
+        self.paned.set_hexpand(True)
+        self.main_box.append(self.paned)
+
+        # Top pane: Apps ScrolledWindow
+        self.scrolled_apps = Gtk.ScrolledWindow()
+        self.scrolled_apps.set_vexpand(True)
+        self.scrolled_apps.set_hexpand(True)
+        self.paned.set_start_child(self.scrolled_apps)
+
+        self.clamp = Adw.Clamp(maximum_size=820, tightening_threshold=650)
+        self.clamp.set_margin_top(12)
+        self.clamp.set_margin_bottom(12)
         self.clamp.set_margin_start(16)
         self.clamp.set_margin_end(16)
-        self.scrolled.set_child(self.clamp)
+        self.scrolled_apps.set_child(self.clamp)
 
         self.list_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.clamp.set_child(self.list_container)
 
-        # Status page when empty
+        # Empty state page
         self.empty_page = Adw.StatusPage(
             icon_name="package-x-generic-symbolic",
             title="No Applications Tracked",
-            description="Add GitHub repositories to install and track .deb updates."
+            description="Add third-party software from GitHub Releases to monitor, verify, and update .deb packages."
         )
-        add_empty_btn = Gtk.Button(label="Add Application")
+        add_empty_btn = Gtk.Button(label="Add Your First Application")
         add_empty_btn.add_css_class("suggested-action")
         add_empty_btn.add_css_class("pill")
         add_empty_btn.set_halign(Gtk.Align.CENTER)
@@ -127,33 +188,167 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
         self.list_container.append(self.list_box)
 
-        # Initial load
+        # Bottom pane: Real-time Activity Log Drawer
+        self.log_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.log_frame.set_size_request(-1, 140)
+        self.paned.set_end_child(self.log_frame)
+
+        # Log Header
+        log_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        log_header.set_margin_start(12)
+        log_header.set_margin_end(12)
+        log_header.set_margin_top(4)
+        log_header.set_margin_bottom(4)
+
+        log_title = Gtk.Label(label="<b>Live Activity Log</b>")
+        log_title.set_use_markup(True)
+        log_title.set_halign(Gtk.Align.START)
+        log_header.append(log_title)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        log_header.append(spacer)
+
+        clear_btn = Gtk.Button.new_from_icon_name("edit-clear-all-symbolic")
+        clear_btn.set_tooltip_text("Clear Log Output")
+        clear_btn.add_css_class("flat")
+        clear_btn.connect("clicked", lambda _b: self.clear_log())
+        log_header.append(clear_btn)
+
+        self.log_frame.append(log_header)
+
+        # Log Scrolled Text View
+        self.log_scrolled = Gtk.ScrolledWindow()
+        self.log_scrolled.set_vexpand(True)
+        self.log_scrolled.set_hexpand(True)
+        self.log_frame.append(self.log_scrolled)
+
+        self.log_text_view = Gtk.TextView()
+        self.log_text_view.set_editable(False)
+        self.log_text_view.set_cursor_visible(False)
+        self.log_text_view.set_monospace(True)
+        self.log_text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_text_view.set_left_margin(12)
+        self.log_text_view.set_right_margin(12)
+        self.log_text_view.set_top_margin(6)
+        self.log_text_view.set_bottom_margin(6)
+        self.log_buffer = self.log_text_view.get_buffer()
+        self.log_scrolled.set_child(self.log_text_view)
+
+        # Initial log entry
+        self.log(f"Debtainium {APP_VERSION} initialized on {get_system_arch()} platform.")
         self.load_data()
 
-    def show_toast(self, message: str, timeout: int = 3):
-        """Display an Adw.Toast message."""
+    def create_summary_chip(self, title: str, value: str, accent: bool = False, success: bool = False) -> dict:
+        """Create a metric card chip for the top dashboard."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_hexpand(True)
+        box.add_css_class("card")
+        box.set_margin_top(2)
+        box.set_margin_bottom(2)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        inner.set_margin_start(10)
+        inner.set_margin_end(10)
+        inner.set_margin_top(6)
+        inner.set_margin_bottom(6)
+        box.append(inner)
+
+        lbl_title = Gtk.Label(label=title)
+        lbl_title.set_halign(Gtk.Align.START)
+        lbl_title.add_css_class("caption")
+        lbl_title.add_css_class("dim-label")
+        inner.append(lbl_title)
+
+        lbl_val = Gtk.Label(label=value)
+        lbl_val.set_halign(Gtk.Align.START)
+        lbl_val.add_css_class("title-3")
+        if accent:
+            lbl_val.add_css_class("accent")
+        elif success:
+            lbl_val.add_css_class("success")
+        inner.append(lbl_val)
+
+        return {"box": box, "value": lbl_val}
+
+    def log(self, message: str):
+        """Append a timestamped message to the live activity console."""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}\n"
+
+        def _append():
+            end_iter = self.log_buffer.get_end_iter()
+            self.log_buffer.insert(end_iter, formatted)
+            # Auto scroll to bottom
+            mark = self.log_buffer.create_mark(None, end_iter, False)
+            self.log_text_view.scroll_to_mark(mark, 0.05, False, 0.0, 1.0)
+
+        GLib.idle_add(_append)
+
+    def clear_log(self):
+        """Clear the activity log."""
+        self.log_buffer.set_text("")
+        self.log("Activity log cleared.")
+
+    def on_toggle_log(self, btn):
+        """Toggle activity log visibility."""
+        visible = btn.get_active()
+        self.log_frame.set_visible(visible)
+
+    def show_toast(self, message: str, timeout: int = 4):
+        """Display an Adw.Toast overlay."""
         toast = Adw.Toast.new(message)
         toast.set_timeout(timeout)
         self.toast_overlay.add_toast(toast)
 
-    def set_progress_visible(self, visible: bool, fraction: float = 0.0):
-        """Toggle progress bar visibility and fraction."""
-        self.progress_bar.set_visible(visible)
-        self.progress_bar.set_fraction(fraction)
+    def set_progress(self, visible: bool, fraction: float = 0.0, status_text: str = ""):
+        """Update progress bar visibility, fraction, and message label."""
+        self.progress_box.set_visible(visible)
+        self.progress_bar.set_fraction(max(0.0, min(1.0, fraction)))
+        if status_text:
+            self.progress_label.set_text(status_text)
 
-    def load_data(self):
-        """Reload apps from disk and refresh UI list."""
-        self.apps = load_apps()
+    def on_search_changed(self, entry):
+        """Filter the displayed list based on the search term."""
+        self.search_filter_text = entry.get_text().strip().lower()
         self.refresh_list_ui()
 
+    def load_data(self):
+        """Reload apps from storage and update dashboard metrics."""
+        self.apps = load_apps()
+        self.log(f"Loaded {len(self.apps)} application(s) from ~/.config/debtainium/apps.json")
+        self.refresh_list_ui()
+
+    def refresh_dashboard_metrics(self):
+        """Update summary cards at the top."""
+        total = len(self.apps)
+        updates = 0
+        uptodate = 0
+
+        for a in self.apps:
+            inst = get_installed_version(a.deb_pkg)
+            if not inst:
+                continue
+            if not a.latest_version:
+                continue
+            if compare_versions(inst, "lt", a.latest_version):
+                updates += 1
+            else:
+                uptodate += 1
+
+        self.total_chip["value"].set_text(str(total))
+        self.updates_chip["value"].set_text(str(updates))
+        self.uptodate_chip["value"].set_text(str(uptodate))
+
     def refresh_list_ui(self):
-        """Render the list of apps into the ListBox."""
-        # Clear existing rows
+        """Render tracked applications into the ListBox using Adw.ExpanderRow."""
         child = self.list_box.get_first_child()
         while child:
             next_child = child.get_next_sibling()
             self.list_box.remove(child)
             child = next_child
+
+        self.refresh_dashboard_metrics()
 
         if not self.apps:
             self.empty_page.set_visible(True)
@@ -163,114 +358,252 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.empty_page.set_visible(False)
         self.list_box.set_visible(True)
 
+        visible_count = 0
         for app in self.apps:
-            row = self.create_app_row(app)
+            # Check filter
+            if self.search_filter_text:
+                q = self.search_filter_text
+                match = (
+                    q in app.name.lower()
+                    or q in app.repo.lower()
+                    or q in app.deb_pkg.lower()
+                    or (q in "update" and is_update_available(app.installed_version, app.latest_version))
+                    or (q in "installed" and bool(app.installed_version))
+                )
+                if not match:
+                    continue
+
+            visible_count += 1
+            row = self.create_verbose_app_row(app)
             self.list_box.append(row)
 
-    def create_app_row(self, app: AppEntry) -> Adw.ActionRow:
-        """Create an Adw.ActionRow for an AppEntry."""
-        row = Adw.ActionRow()
-        row.set_title(app.name)
-
+    def create_verbose_app_row(self, app: AppEntry) -> Adw.ExpanderRow:
+        """Build an interactive, verbose Adw.ExpanderRow with full technical inspection."""
         inst = get_installed_version(app.deb_pkg) or ""
         app.installed_version = inst
         latest = app.latest_version or "-"
 
-        subtitle = f"Repo: {app.repo}  •  Installed: {inst or 'None'}  •  Latest: {latest}"
-        row.set_subtitle(subtitle)
+        has_update = is_update_available(inst, app.latest_version)
 
-        # Prefix icon
+        # Main Expander Row
+        expander = Adw.ExpanderRow()
+        expander.set_title(app.name)
+
+        subtitle_text = f"<b>{app.repo}</b>  •  Installed: {inst or 'None'}  •  Latest: {latest}"
+        expander.set_subtitle(subtitle_text)
+
+        # Prefix package icon
         icon = Gtk.Image.new_from_icon_name("package-x-generic-symbolic")
-        row.add_prefix(icon)
+        icon.set_icon_size(Gtk.IconSize.LARGE)
+        expander.add_prefix(icon)
 
         # Status badge
         badge = Gtk.Label()
         badge.set_valign(Gtk.Align.CENTER)
+        badge.set_margin_end(6)
 
-        has_update = is_update_available(inst, app.latest_version)
         if not inst:
-            badge.set_text("Not Installed")
-            badge.add_css_class("dim-label")
+            badge.set_markup("<span foreground='#888888' font_weight='bold'>Not Installed</span>")
             action_btn_label = "Install"
             action_btn_css = "suggested-action"
         elif has_update:
-            badge.set_markup("<span foreground='#3584e4'><b>Update Available</b></span>")
+            badge.set_markup("<span foreground='#3584e4' font_weight='bold'>Update Available</span>")
             action_btn_label = "Update"
             action_btn_css = "suggested-action"
         else:
-            badge.set_markup("<span foreground='#2ec27e'>Up to Date</span>")
+            badge.set_markup("<span foreground='#2ec27e' font_weight='bold'>Up to Date</span>")
             action_btn_label = "Reinstall"
             action_btn_css = "flat"
 
-        row.add_suffix(badge)
+        expander.add_action(badge)
 
-        # Action Button (Install / Update / Reinstall)
+        # Primary Action Button
         action_btn = Gtk.Button(label=action_btn_label)
         action_btn.add_css_class(action_btn_css)
         action_btn.set_valign(Gtk.Align.CENTER)
-        action_btn.connect("clicked", lambda b, a=app: self.on_update_app(a))
-        row.add_suffix(action_btn)
+        action_btn.connect("clicked", lambda _b, a=app: self.on_update_app(a))
+        expander.add_action(action_btn)
 
-        # Check button
+        # Quick refresh button
         check_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         check_btn.set_valign(Gtk.Align.CENTER)
-        check_btn.set_tooltip_text("Check for update")
+        check_btn.set_tooltip_text("Check for updates")
         check_btn.add_css_class("flat")
-        check_btn.connect("clicked", lambda b, a=app: self.on_check_single_app(a))
-        row.add_suffix(check_btn)
+        check_btn.connect("clicked", lambda _b, a=app: self.on_check_single_app(a))
+        expander.add_action(check_btn)
 
-        # Delete button
-        del_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic")
-        del_btn.set_valign(Gtk.Align.CENTER)
-        del_btn.set_tooltip_text("Remove application")
-        del_btn.add_css_class("flat")
-        del_btn.connect("clicked", lambda b, a=app: self.on_delete_app(a))
-        row.add_suffix(del_btn)
+        # --- SUB-ROWS (Verbose Inspection Details) ---
 
-        return row
+        # 1. Repository & Upstream Link
+        repo_row = Adw.ActionRow()
+        repo_row.set_title("GitHub Upstream")
+        repo_row.set_subtitle(f"https://github.com/{app.repo}")
+        open_gh_btn = Gtk.Button.new_from_icon_name("web-browser-symbolic")
+        open_gh_btn.set_tooltip_text("Open Repository in Web Browser")
+        open_gh_btn.set_valign(Gtk.Align.CENTER)
+        open_gh_btn.add_css_class("flat")
+        open_gh_btn.connect("clicked", lambda _b, r=app.repo: self.open_url(f"https://github.com/{r}"))
+        repo_row.add_suffix(open_gh_btn)
+        expander.add_row(repo_row)
+
+        # 2. Package Management & dpkg details
+        pkg_row = Adw.ActionRow()
+        pkg_row.set_title("Debian Package Identifier")
+        pkg_row.set_subtitle(f"Package: <code>{app.deb_pkg}</code>  •  Target Arch: <code>{get_system_arch()}</code>")
+        expander.add_row(pkg_row)
+
+        # 3. Release & Version tracking
+        ver_row = Adw.ActionRow()
+        ver_row.set_title("Version Status")
+        last_checked = app.last_checked if app.last_checked else "Never"
+        ver_row.set_subtitle(f"Installed: <b>{inst or 'None'}</b>  •  Latest Release: <b>{latest}</b>  •  Last Checked: {last_checked}")
+        expander.add_row(ver_row)
+
+        # 4. Filter & Matching
+        pattern_row = Adw.ActionRow()
+        pattern_row.set_title("Asset Match Filter")
+        patt_desc = f"Regex: <code>{app.asset_pattern}</code>" if app.asset_pattern else "Standard automatic architecture selector"
+        pattern_row.set_subtitle(patt_desc)
+        expander.add_row(pattern_row)
+
+        # 5. Action Bar Inside Expander
+        actions_row = Adw.ActionRow()
+        actions_row.set_title("Application Operations")
+
+        bar_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar_box.set_valign(Gtk.Align.CENTER)
+
+        # View Release Notes Button
+        notes_btn = Gtk.Button(label="Release Notes")
+        notes_btn.set_tooltip_text("Open latest release on GitHub")
+        notes_btn.add_css_class("flat")
+        notes_btn.connect("clicked", lambda _b, r=app.repo: self.open_url(f"https://github.com/{r}/releases/latest"))
+        bar_box.append(notes_btn)
+
+        # Uninstall Button (if package is installed)
+        if inst:
+            uninstall_btn = Gtk.Button(label="Uninstall Package")
+            uninstall_btn.set_tooltip_text("Remove .deb from Debian system via pkexec apt-get remove")
+            uninstall_btn.add_css_class("destructive-action")
+            uninstall_btn.connect("clicked", lambda _b, a=app: self.on_uninstall_package(a))
+            bar_box.append(uninstall_btn)
+
+        # Untrack Button
+        untrack_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+        untrack_btn.set_tooltip_text("Remove from Debtainium tracking list")
+        untrack_btn.add_css_class("flat")
+        untrack_btn.connect("clicked", lambda _b, a=app: self.on_delete_app(a))
+        bar_box.append(untrack_btn)
+
+        actions_row.add_suffix(bar_box)
+        expander.add_row(actions_row)
+
+        return expander
+
+    def open_url(self, url: str):
+        """Open web URL in user's default browser."""
+        self.log(f"Opening browser: {url}")
+        try:
+            Gio.AppInfo.launch_default_for_uri(url, None)
+        except Exception as e:
+            subprocess.Popen(["xdg-open", url])
 
     def on_add_clicked(self, _btn):
-        """Open Add Application dialog."""
-        dialog = AddAppDialog(self)
+        """Open enhanced Add Application dialog."""
+        dialog = VerboseAddAppDialog(self)
         dialog.present()
 
     def on_delete_app(self, app: AppEntry):
-        """Remove an application from tracking."""
+        """Remove application from tracking."""
         self.apps = [a for a in self.apps if a.repo != app.repo]
         save_apps(self.apps)
+        self.log(f"Removed '{app.name}' ({app.repo}) from tracking list.")
         self.refresh_list_ui()
         self.show_toast(f"Removed '{app.name}' from Debtainium.")
 
-    def on_check_single_app(self, app: AppEntry):
-        """Check a single app for updates in a background thread."""
+    def on_uninstall_package(self, app: AppEntry):
+        """Uninstall Debian package using pkexec apt-get remove -y."""
         if self.is_busy:
             return
         self.is_busy = True
-        self.set_progress_visible(True, 0.3)
-        self.show_toast(f"Checking {app.name}...")
+        self.set_progress(True, 0.5, f"Uninstalling {app.deb_pkg} via APT...")
+        self.log(f"Initiating package removal for '{app.deb_pkg}' via pkexec apt-get remove...")
+
+        def worker():
+            try:
+                uninstall_deb_package(app.deb_pkg)
+                self.log(f"Successfully uninstalled package '{app.deb_pkg}' from system.")
+                app.installed_version = ""
+                save_apps(self.apps)
+
+                def success_ui():
+                    self.set_progress(False)
+                    self.refresh_list_ui()
+                    self.is_busy = False
+                    self.show_toast(f"Uninstalled '{app.name}' successfully.")
+
+                GLib.idle_add(success_ui)
+            except Exception as e:
+                self.log(f"ERROR: Failed to uninstall '{app.deb_pkg}': {e}")
+
+                def err_ui():
+                    self.set_progress(False)
+                    self.is_busy = False
+                    self.show_toast(f"Uninstall failed: {e}", timeout=6)
+
+                GLib.idle_add(err_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_check_single_app(self, app: AppEntry):
+        """Check a single app for updates in a background worker."""
+        if self.is_busy:
+            return
+        self.is_busy = True
+        self.set_progress(True, 0.3, f"Checking GitHub for {app.name}...")
+        self.log(f"Querying GitHub Releases API: https://api.github.com/repos/{app.repo}/releases/latest...")
 
         def worker():
             try:
                 release = fetch_latest_release(app.repo)
-                latest = clean_version(release.get("tag_name", ""))
+                tag = release.get("tag_name", "")
+                latest = clean_version(tag)
+                self.log(f"Received release metadata for {app.repo}: tag '{tag}' (normalized: {latest})")
+
+                arch = get_system_arch()
+                asset = pick_release_asset(release, arch=arch, pattern=app.asset_pattern)
+                if asset:
+                    self.log(f"Architecture match for '{arch}': asset '{asset.get('name')}' ({asset.get('size', 0) // 1024} KB)")
+                else:
+                    self.log(f"WARNING: No matching .deb asset found for architecture '{arch}'!")
+
                 app.latest_version = latest
-                save_apps(self.apps)
+                app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 inst = get_installed_version(app.deb_pkg) or ""
                 app.installed_version = inst
+                save_apps(self.apps)
+
+                has_upd = is_update_available(inst, latest)
+                if has_upd:
+                    self.log(f"Update evaluation: installed='{inst}' < latest='{latest}' --> UPDATE AVAILABLE")
+                else:
+                    self.log(f"Update evaluation: {app.name} is up to date ({inst or latest})")
 
                 def update_ui():
-                    self.set_progress_visible(False)
+                    self.set_progress(False)
                     self.refresh_list_ui()
                     self.is_busy = False
-                    if is_update_available(inst, latest):
+                    if has_upd:
                         self.show_toast(f"Update available for {app.name}: {latest}")
                     else:
                         self.show_toast(f"{app.name} is up to date ({inst or latest})")
 
                 GLib.idle_add(update_ui)
             except Exception as e:
+                self.log(f"ERROR: Failed to check {app.name}: {e}")
+
                 def on_err():
-                    self.set_progress_visible(False)
+                    self.set_progress(False)
                     self.is_busy = False
                     self.show_toast(f"Error checking {app.name}: {e}", timeout=5)
 
@@ -283,8 +616,8 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         if self.is_busy or not self.apps:
             return
         self.is_busy = True
-        self.set_progress_visible(True, 0.1)
-        self.show_toast("Checking all apps for updates...")
+        self.set_progress(True, 0.05, "Checking all tracked repositories...")
+        self.log(f"Beginning batch update check for {len(self.apps)} application(s)...")
 
         def worker():
             total = len(self.apps)
@@ -292,21 +625,29 @@ class DebtainiumWindow(Adw.ApplicationWindow):
             for idx, app in enumerate(self.apps):
                 try:
                     frac = (idx + 1) / total
-                    GLib.idle_add(lambda f=frac: self.set_progress_visible(True, f))
+                    GLib.idle_add(lambda f=frac, a=app: self.set_progress(True, f, f"Checking {a.name} ({idx + 1}/{total})..."))
+                    self.log(f"Checking [{idx + 1}/{total}] {app.name} ({app.repo})...")
                     release = fetch_latest_release(app.repo)
-                    latest = clean_version(release.get("tag_name", ""))
+                    tag = release.get("tag_name", "")
+                    latest = clean_version(tag)
                     app.latest_version = latest
+                    app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     inst = get_installed_version(app.deb_pkg) or ""
                     app.installed_version = inst
+
                     if is_update_available(inst, latest):
                         updates_count += 1
+                        self.log(f"  --> Update available: {inst or 'None'} -> {latest}")
+                    else:
+                        self.log(f"  --> Up to date ({inst or latest})")
                 except Exception as e:
-                    sys.stderr.write(f"Check failed for {app.name}: {e}\n")
+                    self.log(f"  --> Check failed: {e}")
 
             save_apps(self.apps)
+            self.log(f"Batch check completed. {updates_count} update(s) ready for installation.")
 
             def done_ui():
-                self.set_progress_visible(False)
+                self.set_progress(False)
                 self.refresh_list_ui()
                 self.is_busy = False
                 if updates_count > 0:
@@ -319,93 +660,116 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def on_update_app(self, app: AppEntry):
-        """Download, verify, and install app in a background thread."""
+        """Download, verify, and install app in a background worker."""
         if self.is_busy:
             return
         self.is_busy = True
-        self.set_progress_visible(True, 0.05)
-        self.show_toast(f"Fetching release for {app.name}...")
+        self.set_progress(True, 0.05, f"Fetching release for {app.name}...")
+        self.log(f"=== Starting update/install workflow for {app.name} ({app.repo}) ===")
 
         def worker():
             try:
                 # 1. Fetch release
+                self.log(f"Fetching latest release metadata from GitHub...")
                 release = fetch_latest_release(app.repo)
                 latest = clean_version(release.get("tag_name", ""))
                 app.latest_version = latest
 
                 # 2. Pick asset
                 arch = get_system_arch()
+                self.log(f"Selecting matching .deb asset for architecture '{arch}'...")
                 asset = pick_release_asset(release, arch=arch, pattern=app.asset_pattern)
                 if not asset:
                     raise DebtainiumError(f"No .deb asset matching arch '{arch}' found in release {latest}")
 
                 asset_name = asset["name"]
                 download_url = asset["browser_download_url"]
+                size_kb = asset.get("size", 0) // 1024
+
+                self.log(f"Asset matched: '{asset_name}' ({size_kb} KB)")
+                self.log(f"Download URL: {download_url}")
 
                 # 3. Download
                 repo_slug = app.repo.replace("/", "_")
                 dest_file = get_cache_dir() / repo_slug / latest / asset_name
 
-                GLib.idle_add(lambda: self.show_toast(f"Downloading {asset_name}..."))
-
-                def progress(downloaded: int, total: int):
-                    if total > 0:
-                        fraction = max(0.1, min(0.85, downloaded / total))
-                        GLib.idle_add(lambda f=fraction: self.set_progress_visible(True, f))
-
                 if not dest_file.exists():
+                    self.log(f"Downloading to cache directory: {dest_file}...")
+
+                    def progress(downloaded: int, total: int):
+                        if total > 0:
+                            fraction = max(0.1, min(0.85, downloaded / total))
+                            pct = int(downloaded / total * 100)
+                            status = f"Downloading {asset_name} ({pct}% • {downloaded // 1024}/{total // 1024} KB)..."
+                            GLib.idle_add(lambda f=fraction, s=status: self.set_progress(True, f, s))
+
                     download_asset_file(download_url, dest_file, progress)
+                    self.log("Asset download completed successfully.")
+                else:
+                    self.log(f"Using existing cached asset: {dest_file}")
 
                 # 4. SHA-256 verification
+                self.log("Searching release for SHA-256 digest verification...")
                 expected_hash = extract_sha256_digest(release, asset_name)
                 if expected_hash:
-                    GLib.idle_add(lambda: self.show_toast("Verifying SHA-256 digest..."))
+                    self.log(f"Found expected SHA-256 digest: {expected_hash}")
+                    GLib.idle_add(lambda: self.set_progress(True, 0.9, "Verifying SHA-256 checksum..."))
                     if not verify_file_sha256(dest_file, expected_hash):
                         dest_file.unlink(missing_ok=True)
-                        raise ChecksumMismatchError("SHA-256 digest mismatch! File was deleted.")
+                        raise ChecksumMismatchError(f"SHA-256 digest verification failed for {asset_name}!")
+                    self.log("Cryptographic SHA-256 integrity verified successfully.")
+                else:
+                    self.log("Notice: No SHA-256 digest provided in release; skipping checksum verification.")
 
-                # 5. Inspect deb to ensure correct deb_pkg
+                # 5. Inspect deb package
                 info = inspect_deb(dest_file)
                 if info.get("Package"):
                     app.deb_pkg = info["Package"]
+                    self.log(f"Debian package name confirmed from deb control: '{app.deb_pkg}'")
 
                 # 6. Install via pkexec apt-get
+                self.log(f"Executing: pkexec apt-get install -y ./{dest_file.name}...")
+                GLib.idle_add(lambda: self.set_progress(True, 0.95, "Installing package via pkexec (Polkit authorization)..."))
                 GLib.idle_add(lambda: self.show_toast("Installing package via pkexec (check prompt)..."))
-                GLib.idle_add(lambda: self.set_progress_visible(True, 0.95))
 
                 install_deb_package(dest_file)
+                self.log(f"APT package installation completed successfully.")
 
                 # 7. Update status
                 new_inst = get_installed_version(app.deb_pkg) or latest
                 app.installed_version = new_inst
+                app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 save_apps(self.apps)
+                self.log(f"Updated status for '{app.name}': Installed Version = {new_inst}")
 
                 def success_ui():
-                    self.set_progress_visible(False)
+                    self.set_progress(False)
                     self.refresh_list_ui()
                     self.is_busy = False
-                    self.show_toast(f"Successfully installed {app.name} ({new_inst})!", timeout=4)
+                    self.show_toast(f"Successfully installed {app.name} ({new_inst})!", timeout=5)
 
                 GLib.idle_add(success_ui)
 
             except Exception as e:
+                self.log(f"ERROR: Installation failed: {e}")
+
                 def err_ui():
-                    self.set_progress_visible(False)
+                    self.set_progress(False)
                     self.is_busy = False
-                    self.show_toast(f"Failed to install {app.name}: {e}", timeout=6)
+                    self.show_toast(f"Installation failed: {e}", timeout=6)
 
                 GLib.idle_add(err_ui)
 
         threading.Thread(target=worker, daemon=True).start()
 
 
-class AddAppDialog(Adw.Window):
-    """Dialog window to add a new tracked GitHub repository."""
+class VerboseAddAppDialog(Adw.Window):
+    """Enhanced Add Application dialog featuring live repository preview."""
 
     def __init__(self, parent_window: DebtainiumWindow):
-        super().__init__(transient_for=parent_window, modal=True, title="Add Application")
+        super().__init__(transient_for=parent_window, modal=True, title="Add Application from GitHub")
         self.parent_win = parent_window
-        self.set_default_size(480, 360)
+        self.set_default_size(540, 500)
 
         toolbar_view = Adw.ToolbarView()
         self.set_content(toolbar_view)
@@ -416,35 +780,108 @@ class AddAppDialog(Adw.Window):
         cancel_btn.connect("clicked", lambda _b: self.destroy())
         header.pack_start(cancel_btn)
 
-        add_btn = Gtk.Button(label="Add")
-        add_btn.add_css_class("suggested-action")
-        add_btn.connect("clicked", self.on_add_submitted)
-        header.pack_end(add_btn)
+        self.add_btn = Gtk.Button(label="Add & Track")
+        self.add_btn.add_css_class("suggested-action")
+        self.add_btn.connect("clicked", self.on_add_submitted)
+        header.pack_end(self.add_btn)
 
         toolbar_view.add_top_bar(header)
 
         # Preferences form
         page = Adw.PreferencesPage()
-        group = Adw.PreferencesGroup(
-            title="Repository Information",
-            description="Enter the GitHub repository details to track."
+        toolbar_view.set_content(page)
+
+        group_input = Adw.PreferencesGroup(
+            title="Repository Specification",
+            description="Enter the GitHub repository details to monitor."
         )
-        page.add(group)
+        page.add(group_input)
 
         self.repo_entry = Adw.EntryRow(title="GitHub Repository")
         self.repo_entry.set_text("")
-        group.add(self.repo_entry)
+        group_input.add(self.repo_entry)
 
+        # Preview Button
+        preview_btn = Gtk.Button(label="Preview & Validate Release Asset")
+        preview_btn.add_css_class("pill")
+        preview_btn.set_halign(Gtk.Align.END)
+        preview_btn.set_margin_top(4)
+        preview_btn.set_margin_bottom(4)
+        preview_btn.connect("clicked", self.on_preview_clicked)
+        group_input.add(preview_btn)
+
+        # Preview Details Box
+        self.group_preview = Adw.PreferencesGroup(
+            title="Upstream Release Preview",
+            description="Live inspection of architecture compatibility."
+        )
+        self.preview_tag_row = Adw.ActionRow(title="Latest Release")
+        self.preview_tag_row.set_subtitle("Not checked yet")
+        self.group_preview.add(self.preview_tag_row)
+
+        self.preview_asset_row = Adw.ActionRow(title="Matched .deb Asset")
+        self.preview_asset_row.set_subtitle("Enter repository and click Preview")
+        self.group_preview.add(self.preview_asset_row)
+
+        page.add(self.group_preview)
+
+        # Advanced Settings
+        group_adv = Adw.PreferencesGroup(
+            title="Optional Overrides",
+            description="Custom display name, package identifier, or asset regex."
+        )
         self.name_entry = Adw.EntryRow(title="Display Name (optional)")
-        group.add(self.name_entry)
+        group_adv.add(self.name_entry)
 
         self.deb_entry = Adw.EntryRow(title="Debian Package Name (optional)")
-        group.add(self.deb_entry)
+        group_adv.add(self.deb_entry)
 
         self.pattern_entry = Adw.EntryRow(title="Asset Regex Filter (optional)")
-        group.add(self.pattern_entry)
+        group_adv.add(self.pattern_entry)
 
-        toolbar_view.set_content(page)
+        page.add(group_adv)
+
+    def on_preview_clicked(self, _btn):
+        """Fetch and inspect release asset before adding."""
+        repo_raw = self.repo_entry.get_text().strip()
+        if not repo_raw:
+            self.parent_win.show_toast("Please enter a GitHub repository.")
+            return
+
+        try:
+            repo = normalize_repo(repo_raw)
+        except ValueError as e:
+            self.parent_win.show_toast(str(e))
+            return
+
+        self.preview_tag_row.set_subtitle("Fetching from GitHub API...")
+        self.preview_asset_row.set_subtitle("Matching architecture assets...")
+
+        def worker():
+            try:
+                release = fetch_latest_release(repo)
+                tag = release.get("tag_name", "")
+                arch = get_system_arch()
+                pattern = self.pattern_entry.get_text().strip()
+                asset = pick_release_asset(release, arch=arch, pattern=pattern)
+
+                def update_preview():
+                    self.preview_tag_row.set_subtitle(f"Tag: <b>{tag}</b> (published: {release.get('published_at', '')[:10]})")
+                    if asset:
+                        size_kb = asset.get("size", 0) // 1024
+                        self.preview_asset_row.set_subtitle(f"<b>{asset.get('name')}</b> ({size_kb} KB) • Arch: {arch}")
+                    else:
+                        self.preview_asset_row.set_subtitle(f"<span foreground='#e01b24'>No matching .deb for '{arch}' found!</span>")
+
+                GLib.idle_add(update_preview)
+            except Exception as e:
+                def on_err():
+                    self.preview_tag_row.set_subtitle(f"<span foreground='#e01b24'>Error: {e}</span>")
+                    self.preview_asset_row.set_subtitle("Failed to fetch release")
+
+                GLib.idle_add(on_err)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_add_submitted(self, _btn):
         repo_raw = self.repo_entry.get_text().strip()
@@ -462,14 +899,13 @@ class AddAppDialog(Adw.Window):
         deb_pkg = self.deb_entry.get_text().strip() or name.lower()
         asset_pattern = self.pattern_entry.get_text().strip()
 
-        # Check existing
         for a in self.parent_win.apps:
             if a.repo.lower() == repo.lower():
                 self.parent_win.show_toast(f"'{repo}' is already tracked.")
                 return
 
         self.destroy()
-        self.parent_win.show_toast(f"Adding '{name}'...")
+        self.parent_win.log(f"Adding new tracked repository: '{repo}' as '{name}' (pkg: '{deb_pkg}')...")
 
         def fetch_and_add():
             latest = ""
@@ -477,7 +913,7 @@ class AddAppDialog(Adw.Window):
                 release = fetch_latest_release(repo)
                 latest = clean_version(release.get("tag_name", ""))
             except Exception as e:
-                sys.stderr.write(f"Initial release check failed: {e}\n")
+                self.parent_win.log(f"Warning: Could not fetch initial release for {repo}: {e}")
 
             inst = get_installed_version(deb_pkg) or ""
             new_entry = AppEntry(
@@ -487,11 +923,13 @@ class AddAppDialog(Adw.Window):
                 asset_pattern=asset_pattern,
                 installed_version=inst,
                 latest_version=latest,
+                last_checked=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
 
             def update_ui():
                 self.parent_win.apps.append(new_entry)
                 save_apps(self.parent_win.apps)
+                self.parent_win.log(f"Successfully added '{name}' to tracked applications.")
                 self.parent_win.refresh_list_ui()
                 self.parent_win.show_toast(f"Added '{name}' to Debtainium.")
 
@@ -506,7 +944,7 @@ class DebtainiumApplication(Adw.Application):
     def __init__(self):
         super().__init__(
             application_id="org.debtainium.Debtainium",
-            flags=gi.repository.Gio.ApplicationFlags.FLAGS_NONE,
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
         )
 
     def do_activate(self):

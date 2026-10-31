@@ -530,3 +530,28 @@ def install_deb_package(deb_path: Path) -> Tuple[int, str, str]:
         raise InstallationError("pkexec is not installed on this system.")
     except Exception as e:
         raise InstallationError(f"Error executing pkexec: {e}")
+
+
+def uninstall_deb_package(package_name: str) -> Tuple[int, str, str]:
+    """
+    Remove an installed package using `pkexec apt-get remove -y <package_name>`.
+    """
+    if not package_name:
+        raise ValueError("Package name cannot be empty.")
+
+    cmd = ["pkexec", "apt-get", "remove", "-y", package_name]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Exit code {proc.returncode}"
+            raise InstallationError(f"APT removal failed ({err_msg})")
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        raise InstallationError("pkexec is not installed on this system.")
+    except Exception as e:
+        raise InstallationError(f"Error executing pkexec: {e}")
