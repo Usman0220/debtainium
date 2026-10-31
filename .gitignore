@@ -13,3 +13,4 @@ __pycache__/
 
 # Package builds (published to GitHub Releases)
 debtainium_*.deb
+*.sha256
