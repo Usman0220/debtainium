@@ -62,16 +62,36 @@ command -v apt-get >/dev/null 2>&1 || die "this installer needs apt-get (Debian 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required (package: coreutils)"
 
+# Ask the API first: the /releases/latest redirect is served by the CDN and can
+# briefly point at a tag that has just been deleted. If the API is rate limited,
+# fall back to the redirect.
+api_tag() {
+    local auth=()
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    fi
+    curl -fsSL -H 'Accept: application/vnd.github+json' "${auth[@]}" \
+        "https://api.github.com/repos/${OWNER_REPO}/releases/latest" 2>/dev/null \
+        | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -1
+}
+
+redirect_tag() {
+    local effective
+    effective="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "${BASE}/releases/latest" 2>/dev/null)" || return 1
+    case "$effective" in
+        */tag/*) printf '%s\n' "${effective##*/tag/}" ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ -z "$TAG" ]; then
     printf 'Looking up the latest Debtainium release...\n'
-    EFFECTIVE="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "${BASE}/releases/latest")" \
-        || die "could not reach GitHub; check your network connection"
-    case "$EFFECTIVE" in
-        */tag/*) TAG="${EFFECTIVE##*/tag/}" ;;
-        *) die "GitHub did not return a release: $EFFECTIVE" ;;
-    esac
+    TAG="$(api_tag || true)"
+    if [ -z "$TAG" ]; then
+        TAG="$(redirect_tag || true)"
+    fi
+    [ -n "$TAG" ] || die "could not reach GitHub; check your network connection"
 fi
-[ -n "$TAG" ] || die "could not determine a release tag"
 
 VERSION="${TAG#v}"
 DEB_NAME="debtainium_${VERSION}_all.deb"
