@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from debtainium.core import (
+    APP_VERSION,
     AppEntry,
     ChecksumMismatchError,
     DebtainiumError,
@@ -21,6 +23,7 @@ from debtainium.core import (
     clean_version,
     compare_versions,
     download_asset_file,
+    export_apps,
     extract_sha256_digest,
     fetch_latest_release,
     get_cache_dir,
@@ -30,6 +33,7 @@ from debtainium.core import (
     install_deb_package,
     is_update_available,
     load_apps,
+    merge_imported_apps,
     normalize_repo,
     pick_release_asset,
     save_apps,
@@ -88,10 +92,41 @@ def cmd_add(args: argparse.Namespace) -> int:
         installed_version=installed_version,
         latest_version=latest_version,
         last_checked=datetime.datetime.now().isoformat(timespec="seconds"),
+        auto_update=bool(getattr(args, "auto", False)),
     )
     apps.append(new_app)
     save_apps(apps)
-    print(f"Successfully added '{name}' to Debtainium.")
+    suffix = " [auto-update enabled]" if new_app.auto_update else ""
+    print(f"Successfully added '{name}' to Debtainium.{suffix}")
+    return 0
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    """Enable or disable automatic installation for a tracked app."""
+    identifier = args.target.strip().lower()
+    apps = load_apps()
+    matched = [
+        app for app in apps
+        if app.repo.lower() == identifier
+        or app.name.lower() == identifier
+        or app.deb_pkg.lower() == identifier
+    ]
+    if not matched:
+        sys.stderr.write(f"No tracked application matched '{args.target}'.\n")
+        return 1
+
+    enabled = args.state == "on"
+    for app in matched:
+        app.auto_update = enabled
+    save_apps(apps)
+
+    names = ", ".join(a.name for a in matched)
+    if enabled:
+        print(f"Auto-update enabled for {names}.")
+        print("Run 'debtainium update --auto' (or enable debtainium-autoupdate.timer)")
+        print("to install these automatically when a release appears.")
+    else:
+        print(f"Auto-update disabled for {names}.")
     return 0
 
 
@@ -118,12 +153,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     """List all tracked applications and their status."""
     apps = load_apps()
     if not apps:
+        if getattr(args, "json", False):
+            print(json.dumps({"apps": []}, indent=2))
+            return 0
         print("No applications are currently tracked by Debtainium.")
         print("Add one using: debtainium add <owner/repo>")
         return 0
 
     # Refresh installed versions
-    headers = ("NAME", "REPO", "DEB PKG", "INSTALLED", "LATEST", "STATUS")
     rows = []
     for app in apps:
         inst = get_installed_version(app.deb_pkg) or ""
@@ -145,11 +182,20 @@ def cmd_list(args: argparse.Namespace) -> int:
             inst if inst else "-",
             app.latest_version if app.latest_version else "-",
             status,
+            "auto" if app.auto_update else "-",
         ))
 
     save_apps(apps)
 
-    # Format table
+    if getattr(args, "json", False):
+        payload = {"apps": [dict(zip(
+            ("name", "repo", "deb_pkg", "installed", "latest", "status", "auto_update"),
+            (r[0], r[1], r[2], r[3], r[4], r[5], r[6] == "auto"),
+        )) for r in rows]}
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    headers = ("NAME", "REPO", "DEB PKG", "INSTALLED", "LATEST", "STATUS", "AUTO")
     col_widths = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
     header_str = "  ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
     sep_str = "  ".join("-" * col_widths[i] for i in range(len(headers)))
@@ -313,7 +359,7 @@ def update_single_app(app: AppEntry) -> bool:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
-    """Download and install updates for one or all tracked apps."""
+    """Download and install updates for one, all, or auto-flagged apps."""
     apps = load_apps()
     if not apps:
         print("No tracked applications. Run 'debtainium add <owner/repo>' first.")
@@ -330,16 +376,24 @@ def cmd_update(args: argparse.Namespace) -> int:
             return 1
         to_update = candidates
     else:
-        # Check all apps to determine which ones need updating
-        print(f"Checking for updates before proceeding (arch: {get_system_arch()})...")
+        pool = [app for app in apps if app.auto_update] if args.auto else apps
+        if args.auto and not pool:
+            print("No applications are marked for auto-update.")
+            print("Enable one with: debtainium auto <app> on")
+            return 0
+
+        label = "auto-update" if args.auto else "all"
+        print(f"Checking {len(pool)} {label} application(s) before proceeding "
+              f"(arch: {get_system_arch()})...")
         to_update = []
-        for app in apps:
+        for app in pool:
             has_update, msg = check_single_app(app)
             if has_update:
                 to_update.append(app)
+                print(f"• {app.name}: {msg}")
 
         if not to_update:
-            print("All tracked applications are up to date.")
+            print("All checked applications are up to date.")
             save_apps(apps)
             return 0
 
@@ -409,11 +463,80 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export the tracked-app list as portable JSON."""
+    apps = load_apps()
+    payload = export_apps(apps)
+    text = json.dumps(payload, indent=2) + "\n"
+
+    if args.file:
+        path = Path(args.file).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"Error: could not write {path}: {e}\n")
+            return 1
+        print(f"Exported {len(apps)} application(s) to {path}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import tracked apps from JSON produced by `debtainium export`."""
+    try:
+        if args.file == "-":
+            raw = sys.stdin.read()
+        else:
+            raw = Path(args.file).expanduser().read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except OSError as e:
+        sys.stderr.write(f"Error: could not read {args.file}: {e}\n")
+        return 1
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"Error: {args.file} is not valid JSON: {e}\n")
+        return 1
+
+    entries = data.get("apps") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        sys.stderr.write("Error: expected an 'apps' list in the import file.\n")
+        return 1
+
+    imported: List[AppEntry] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            repo = normalize_repo(str(item.get("repo", "")))
+        except ValueError as e:
+            sys.stderr.write(f"Warning: skipping entry ({e})\n")
+            continue
+        clean = dict(item)
+        clean["repo"] = repo
+        imported.append(AppEntry.from_dict(clean))
+
+    if not imported:
+        sys.stderr.write("Error: no importable applications found.\n")
+        return 1
+
+    existing = load_apps()
+    merged, added, updated = merge_imported_apps(existing, imported, replace=args.replace)
+    save_apps(merged)
+    mode = "replaced with" if args.replace else "merged:"
+    print(f"Import {mode} {len(imported)} entr(y/ies) -> {added} added, {updated} updated, "
+          f"{len(merged)} tracked in total.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="debtainium",
         description="Obtainium-style installer and updater for GitHub Release .deb packages on Debian/Ubuntu.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"debtainium {APP_VERSION}"
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
 
@@ -423,6 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--name", help="Display name for the application")
     p_add.add_argument("--pattern", help="Custom regex pattern for .deb asset matching")
     p_add.add_argument("--deb-pkg", help="Debian package name if different from repo name")
+    p_add.add_argument("--auto", action="store_true", help="Install updates automatically")
     p_add.set_defaults(func=cmd_add)
 
     # remove
@@ -432,6 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list
     p_list = subparsers.add_parser("list", help="List all tracked applications")
+    p_list.add_argument("--json", action="store_true", help="Machine-readable output")
     p_list.set_defaults(func=cmd_list)
 
     # check
@@ -442,7 +567,27 @@ def build_parser() -> argparse.ArgumentParser:
     # update
     p_upd = subparsers.add_parser("update", help="Download and install updates")
     p_upd.add_argument("repo", nargs="?", help="Specific repo to update (updates all eligible if omitted)")
+    p_upd.add_argument("--all", action="store_true", help="Update every tracked app with an update")
+    p_upd.add_argument("--auto", action="store_true",
+                       help="Only update apps flagged with 'debtainium auto <app> on'")
     p_upd.set_defaults(func=cmd_update)
+
+    # auto
+    p_auto = subparsers.add_parser("auto", help="Enable/disable automatic installation for an app")
+    p_auto.add_argument("target", help="Repository, application or package name")
+    p_auto.add_argument("state", choices=("on", "off"), help="'on' or 'off'")
+    p_auto.set_defaults(func=cmd_auto)
+
+    # export / import
+    p_exp = subparsers.add_parser("export", help="Export tracked apps as JSON")
+    p_exp.add_argument("-f", "--file", help="Write to this file instead of stdout")
+    p_exp.set_defaults(func=cmd_export)
+
+    p_imp = subparsers.add_parser("import", help="Import tracked apps from JSON")
+    p_imp.add_argument("file", help="JSON file to read ('-' for stdin)")
+    p_imp.add_argument("--replace", action="store_true",
+                       help="Replace the current list instead of merging")
+    p_imp.set_defaults(func=cmd_import)
 
     # notify
     p_not = subparsers.add_parser("notify", help="Periodic check and desktop notification (used by systemd timer)")

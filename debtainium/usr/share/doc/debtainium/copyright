@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: debtainium
-Upstream-Contact: Debtainium Developers <maintainers@debtainium.org>
+Upstream-Contact: Usman0220 <usman0220@users.noreply.github.com>
 Source: https://github.com/Usman0220/debtainium
 
 Files: *
-Copyright: 2026 Debtainium Developers <maintainers@debtainium.org>
+Copyright: 2026 Usman0220 <usman0220@users.noreply.github.com>
 License: MIT
 
 License: MIT

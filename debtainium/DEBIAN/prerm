@@ -10,6 +10,8 @@ case "$1" in
                     if [ -n "$user" ]; then
                         su - "$user" -c "systemctl --user stop debtainium-notify.timer 2>/dev/null || true"
                         su - "$user" -c "systemctl --user disable debtainium-notify.timer 2>/dev/null || true"
+                        su - "$user" -c "systemctl --user stop debtainium-autoupdate.timer 2>/dev/null || true"
+                        su - "$user" -c "systemctl --user disable debtainium-autoupdate.timer 2>/dev/null || true"
                     fi
                 done
             fi

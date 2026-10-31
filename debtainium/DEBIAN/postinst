@@ -11,10 +11,17 @@ case "$1" in
             gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
         fi
 
-        echo "Debtainium 1.0.1 installed successfully."
+        if command -v appstreamcli >/dev/null 2>&1; then
+            appstreamcli refresh --source=os --no-net --quiet >/dev/null 2>&1 || true
+        fi
+
+        echo "Debtainium 1.1.0 installed successfully."
         echo "Tip: Run 'debtainium gui' to launch the GUI or 'debtainium --help' for CLI."
-        echo "To enable background update checks (every 6 hours), run:"
+        echo "To check for updates in the background (every 6 hours):"
         echo "  systemctl --user enable --now debtainium-notify.timer"
+        echo "To install flagged updates automatically (daily, needs a polkit rule):"
+        echo "  see /usr/share/doc/debtainium/examples/49-debtainium-autoupdate.rules"
+        echo "  systemctl --user enable --now debtainium-autoupdate.timer"
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         ;;

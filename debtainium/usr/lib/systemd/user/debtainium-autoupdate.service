@@ -1,0 +1,14 @@
+[Unit]
+Description=Debtainium automatic installation of flagged updates
+Documentation=https://github.com/Usman0220/debtainium
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/debtainium update --auto
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

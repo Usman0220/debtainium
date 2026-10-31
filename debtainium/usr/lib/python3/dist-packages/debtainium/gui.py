@@ -8,12 +8,13 @@ and full package lifecycle management.
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import gi
 
@@ -31,6 +32,7 @@ from debtainium.core import (
     clean_version,
     compare_versions,
     download_asset_file,
+    export_apps,
     extract_sha256_digest,
     fetch_latest_release,
     get_cache_dir,
@@ -40,6 +42,7 @@ from debtainium.core import (
     install_deb_package,
     is_update_available,
     load_apps,
+    merge_imported_apps,
     normalize_repo,
     pick_release_asset,
     save_apps,
@@ -71,7 +74,7 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.header_bar = Adw.HeaderBar()
         title_widget = Adw.WindowTitle(
             title="Debtainium",
-            subtitle=f"GitHub .deb Manager • {get_system_arch()}"
+            subtitle=f"GitHub .deb Manager • v{APP_VERSION} • {get_system_arch()}"
         )
         self.header_bar.set_title_widget(title_widget)
 
@@ -82,6 +85,12 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.header_bar.pack_start(self.add_btn)
 
         # End Header Buttons
+        self.update_all_btn = Gtk.Button(label="Update All")
+        self.update_all_btn.set_tooltip_text("Install every available update")
+        self.update_all_btn.add_css_class("suggested-action")
+        self.update_all_btn.connect("clicked", self.on_update_all_clicked)
+        self.header_bar.pack_end(self.update_all_btn)
+
         self.refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
         self.refresh_btn.set_tooltip_text("Check All Tracked Apps for Updates")
         self.refresh_btn.connect("clicked", self.on_check_all_clicked)
@@ -93,6 +102,30 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.log_toggle_btn.set_active(True)
         self.log_toggle_btn.connect("toggled", self.on_toggle_log)
         self.header_bar.pack_end(self.log_toggle_btn)
+
+        # Main menu: background check scheduling + about
+        menu = Gio.Menu()
+        menu.append("Import tracked apps…", "win.import_apps")
+        menu.append("Export tracked apps…", "win.export_apps")
+        menu.append("Enable 6-hourly background checks", "win.enable_timer")
+        menu.append("Disable background checks", "win.disable_timer")
+        menu.append("About Debtainium", "win.about")
+        self.menu_btn = Gtk.MenuButton()
+        self.menu_btn.set_icon_name("open-menu-symbolic")
+        self.menu_btn.set_tooltip_text("Main Menu")
+        self.menu_btn.set_menu_model(menu)
+        self.header_bar.pack_end(self.menu_btn)
+
+        for name, handler in (
+            ("import_apps", self.on_import_apps),
+            ("export_apps", self.on_export_apps),
+            ("enable_timer", self.on_enable_timer),
+            ("disable_timer", self.on_disable_timer),
+            ("about", self.on_about),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self.add_action(action)
 
         self.toolbar_view.add_top_bar(self.header_bar)
 
@@ -295,6 +328,148 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         visible = btn.get_active()
         self.log_frame.set_visible(visible)
 
+    def _systemctl_user(self, *args: str) -> Tuple[bool, str]:
+        """Run `systemctl --user ...` and return (ok, combined output)."""
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", *args],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            return proc.returncode == 0, out.strip()
+        except FileNotFoundError:
+            return False, "systemctl not found"
+        except subprocess.TimeoutExpired:
+            return False, "systemctl timed out"
+
+    def on_export_apps(self, _action, _param):
+        """Save the tracked-app list to a JSON file the user picks."""
+        if not self.apps:
+            self.show_toast("Nothing to export yet.")
+            return
+        dialog = Gtk.FileDialog(title="Export tracked applications")
+        dialog.set_initial_name("debtainium-apps.json")
+        dialog.save(self, None, self._export_finish)
+
+    def _export_finish(self, dialog, result):
+        try:
+            gfile = dialog.save_finish(result)
+        except GLib.Error as e:
+            self.log(f"Export cancelled: {e.message}")
+            return
+        path = Path(gfile.get_path())
+        try:
+            payload = export_apps(self.apps)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError as e:
+            self.log(f"ERROR: export failed: {e}")
+            self.show_toast("Export failed — see the log.", timeout=6)
+            return
+        self.log(f"Exported {len(self.apps)} application(s) to {path}")
+        self.show_toast(f"Exported {len(self.apps)} app(s).")
+
+    def on_import_apps(self, _action, _param):
+        """Merge a JSON export back into the tracked list."""
+        dialog = Gtk.FileDialog(title="Import tracked applications")
+        json_filter = Gtk.FileFilter()
+        json_filter.set_name("JSON files")
+        json_filter.add_pattern("*.json")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(json_filter)
+        dialog.set_filters(store)
+        dialog.set_default_filter(json_filter)
+        dialog.open(self, None, self._import_finish)
+
+    def _import_finish(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error as e:
+            self.log(f"Import cancelled: {e.message}")
+            return
+        path = Path(gfile.get_path())
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            self.log(f"ERROR: could not read {path}: {e}")
+            self.show_toast("Import failed — cannot read file.", timeout=6)
+            return
+        except json.JSONDecodeError as e:
+            self.log(f"ERROR: {path} is not valid JSON: {e}")
+            self.show_toast("Import failed — invalid JSON.", timeout=6)
+            return
+
+        entries = data.get("apps") if isinstance(data, dict) else data
+        if not isinstance(entries, list):
+            self.log(f"ERROR: {path} has no 'apps' list.")
+            self.show_toast("Import failed — no 'apps' list.", timeout=6)
+            return
+
+        imported: List[AppEntry] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                repo = normalize_repo(str(item.get("repo", "")))
+            except ValueError as e:
+                self.log(f"Skipping import entry: {e}")
+                continue
+            clean = dict(item)
+            clean["repo"] = repo
+            imported.append(AppEntry.from_dict(clean))
+
+        if not imported:
+            self.show_toast("Import file contained no usable entries.", timeout=6)
+            return
+
+        merged, added, updated = merge_imported_apps(self.apps, imported)
+        self.apps = merged
+        save_apps(self.apps)
+        self.refresh_list_ui()
+        self.log(f"Imported {path.name}: {added} added, {updated} updated, "
+                 f"{len(self.apps)} tracked in total.")
+        self.show_toast(f"Imported: {added} added, {updated} updated.")
+
+    def on_enable_timer(self, _action, _param):
+        """Enable and start the background update-check timer."""
+        ok, out = self._systemctl_user("enable", "--now", "debtainium-notify.timer")
+        if ok:
+            self.log("Enabled debtainium-notify.timer (checks every 6 hours).")
+            self.show_toast("Background checks enabled (every 6 hours).")
+        else:
+            self.log(f"ERROR: could not enable timer: {out}")
+            self.show_toast("Could not enable background checks.", timeout=6)
+
+    def on_disable_timer(self, _action, _param):
+        """Disable and stop the background update-check timer."""
+        ok, out = self._systemctl_user("disable", "--now", "debtainium-notify.timer")
+        if ok:
+            self.log("Disabled debtainium-notify.timer.")
+            self.show_toast("Background checks disabled.")
+        else:
+            self.log(f"ERROR: could not disable timer: {out}")
+            self.show_toast("Could not disable background checks.", timeout=6)
+
+    def on_about(self, _action, _param):
+        """Show the About dialog."""
+        about = Adw.AboutWindow(transient_for=self, modal=True)
+        about.set_application_name("Debtainium")
+        about.set_application_icon("debtainium")
+        about.set_version(APP_VERSION)
+        about.set_developer_name("Debtainium Developers")
+        about.set_website("https://github.com/Usman0220/debtainium")
+        about.set_issue_url("https://github.com/Usman0220/debtainium/issues")
+        about.set_license_type(Gtk.License.MIT_X11)
+        about.set_comments(
+            "Tracks third-party software published as .deb assets on GitHub "
+            "Releases, verifies SHA-256 digests, and installs updates through "
+            "polkit and apt."
+        )
+        about.present()
+
     def show_toast(self, message: str, timeout: int = 4):
         """Display an Adw.Toast overlay."""
         toast = Adw.Toast.new(message)
@@ -360,17 +535,24 @@ class DebtainiumWindow(Adw.ApplicationWindow):
 
         visible_count = 0
         for app in self.apps:
-            # Check filter
+            # Check filter: every whitespace-separated term must appear somewhere
+            # in the row's searchable text (name, repo, package, status, auto).
             if self.search_filter_text:
-                q = self.search_filter_text
-                match = (
-                    q in app.name.lower()
-                    or q in app.repo.lower()
-                    or q in app.deb_pkg.lower()
-                    or (q in "update" and is_update_available(app.installed_version, app.latest_version))
-                    or (q in "installed" and bool(app.installed_version))
-                )
-                if not match:
+                inst = get_installed_version(app.deb_pkg) or ""
+                if not inst:
+                    status = "not installed"
+                elif is_update_available(inst, app.latest_version):
+                    status = "update available"
+                else:
+                    status = "up to date"
+                haystack = " ".join((
+                    app.name,
+                    app.repo,
+                    app.deb_pkg,
+                    status,
+                    "auto" if app.auto_update else "",
+                )).lower()
+                if not all(term in haystack for term in self.search_filter_text.split()):
                     continue
 
             visible_count += 1
@@ -449,7 +631,11 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         # 2. Package Management & dpkg details
         pkg_row = Adw.ActionRow()
         pkg_row.set_title("Debian Package Identifier")
-        pkg_row.set_subtitle(f"Package: <code>{app.deb_pkg}</code>  •  Target Arch: <code>{get_system_arch()}</code>")
+        pkg_row.set_subtitle(
+            "Package: <tt>" + GLib.markup_escape_text(app.deb_pkg, -1)
+            + "</tt>  •  Target Arch: <tt>" + GLib.markup_escape_text(get_system_arch(), -1)
+            + "</tt>"
+        )
         expander.add_row(pkg_row)
 
         # 3. Release & Version tracking
@@ -462,11 +648,30 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         # 4. Filter & Matching
         pattern_row = Adw.ActionRow()
         pattern_row.set_title("Asset Match Filter")
-        patt_desc = f"Regex: <code>{app.asset_pattern}</code>" if app.asset_pattern else "Standard automatic architecture selector"
+        patt_desc = (
+            "Regex: <tt>" + GLib.markup_escape_text(app.asset_pattern, -1) + "</tt>"
+            if app.asset_pattern
+            else "Standard automatic architecture selector"
+        )
         pattern_row.set_subtitle(patt_desc)
         expander.add_row(pattern_row)
 
-        # 5. Action Bar Inside Expander
+        # 5. Auto-update policy
+        auto_row = Adw.ActionRow()
+        auto_row.set_title("Automatic Installation")
+        auto_row.set_subtitle(
+            "Install new releases without asking when "
+            "<tt>debtainium update --auto</tt> runs"
+        )
+        auto_switch = Gtk.Switch()
+        auto_switch.set_valign(Gtk.Align.CENTER)
+        auto_switch.set_active(bool(app.auto_update))
+        auto_switch.connect("state-set", self.on_auto_update_toggled, app)
+        auto_row.add_suffix(auto_switch)
+        auto_row.set_activatable_widget(auto_switch)
+        expander.add_row(auto_row)
+
+        # 6. Action Bar Inside Expander
         actions_row = Adw.ActionRow()
         actions_row.set_title("Application Operations")
 
@@ -475,9 +680,9 @@ class DebtainiumWindow(Adw.ApplicationWindow):
 
         # View Release Notes Button
         notes_btn = Gtk.Button(label="Release Notes")
-        notes_btn.set_tooltip_text("Open latest release on GitHub")
+        notes_btn.set_tooltip_text("Show the latest release notes")
         notes_btn.add_css_class("flat")
-        notes_btn.connect("clicked", lambda _b, r=app.repo: self.open_url(f"https://github.com/{r}/releases/latest"))
+        notes_btn.connect("clicked", lambda _b, a=app: ReleaseNotesDialog(self, a).present())
         bar_box.append(notes_btn)
 
         # Uninstall Button (if package is installed)
@@ -555,6 +760,18 @@ class DebtainiumWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_auto_update_toggled(self, _switch, state, app: AppEntry):
+        """Persist a per-app auto-update change made from the expander row."""
+        app.auto_update = bool(state)
+        save_apps(self.apps)
+        if state:
+            self.log(f"Auto-update enabled for {app.name} ({app.repo}).")
+            self.show_toast(f"{app.name} will be installed automatically.")
+        else:
+            self.log(f"Auto-update disabled for {app.name} ({app.repo}).")
+            self.show_toast(f"{app.name} now requires manual updates.")
+        return False  # let Gtk update the switch itself
+
     def on_check_single_app(self, app: AppEntry):
         """Check a single app for updates in a background worker."""
         if self.is_busy:
@@ -625,7 +842,11 @@ class DebtainiumWindow(Adw.ApplicationWindow):
             for idx, app in enumerate(self.apps):
                 try:
                     frac = (idx + 1) / total
-                    GLib.idle_add(lambda f=frac, a=app: self.set_progress(True, f, f"Checking {a.name} ({idx + 1}/{total})..."))
+                    GLib.idle_add(
+                        lambda f=frac, a=app, i=idx, t=total: self.set_progress(
+                            True, f, f"Checking {a.name} ({i + 1}/{t})..."
+                        )
+                    )
                     self.log(f"Checking [{idx + 1}/{total}] {app.name} ({app.repo})...")
                     release = fetch_latest_release(app.repo)
                     tag = release.get("tag_name", "")
@@ -659,6 +880,88 @@ class DebtainiumWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _install_latest(self, app: AppEntry) -> str:
+        """
+        Download, verify and install the newest release of `app`.
+
+        Blocking; must run off the main loop. Returns the version now installed.
+        Raises on any failure (nothing is swallowed here so batch callers can
+        report per-app errors).
+        """
+        # 1. Fetch release
+        self.log("Fetching latest release metadata from GitHub...")
+        release = fetch_latest_release(app.repo)
+        latest = clean_version(release.get("tag_name", ""))
+        app.latest_version = latest
+
+        # 2. Pick asset
+        arch = get_system_arch()
+        self.log(f"Selecting matching .deb asset for architecture '{arch}'...")
+        asset = pick_release_asset(release, arch=arch, pattern=app.asset_pattern)
+        if not asset:
+            raise DebtainiumError(f"No .deb asset matching arch '{arch}' found in release {latest}")
+
+        asset_name = asset["name"]
+        download_url = asset["browser_download_url"]
+        size_kb = asset.get("size", 0) // 1024
+
+        self.log(f"Asset matched: '{asset_name}' ({size_kb} KB)")
+        self.log(f"Download URL: {download_url}")
+
+        # 3. Download
+        repo_slug = app.repo.replace("/", "_")
+        dest_file = get_cache_dir() / repo_slug / latest / asset_name
+
+        if not dest_file.exists():
+            self.log(f"Downloading to cache directory: {dest_file}...")
+
+            def progress(downloaded: int, total: int):
+                if total > 0:
+                    fraction = max(0.1, min(0.85, downloaded / total))
+                    pct = int(downloaded / total * 100)
+                    status = f"Downloading {asset_name} ({pct}% • {downloaded // 1024}/{total // 1024} KB)..."
+                    GLib.idle_add(lambda f=fraction, s=status: self.set_progress(True, f, s))
+
+            download_asset_file(download_url, dest_file, progress)
+            self.log("Asset download completed successfully.")
+        else:
+            self.log(f"Using existing cached asset: {dest_file}")
+
+        # 4. SHA-256 verification
+        self.log("Searching release for SHA-256 digest verification...")
+        expected_hash = extract_sha256_digest(release, asset_name)
+        if expected_hash:
+            self.log(f"Found expected SHA-256 digest: {expected_hash}")
+            GLib.idle_add(lambda: self.set_progress(True, 0.9, "Verifying SHA-256 checksum..."))
+            if not verify_file_sha256(dest_file, expected_hash):
+                dest_file.unlink(missing_ok=True)
+                raise ChecksumMismatchError(f"SHA-256 digest verification failed for {asset_name}!")
+            self.log("Cryptographic SHA-256 integrity verified successfully.")
+        else:
+            self.log("Notice: No SHA-256 digest provided in release; skipping checksum verification.")
+
+        # 5. Inspect deb package
+        info = inspect_deb(dest_file)
+        if info.get("Package"):
+            app.deb_pkg = info["Package"]
+            self.log(f"Debian package name confirmed from deb control: '{app.deb_pkg}'")
+
+        # 6. Install via pkexec apt-get
+        self.log(f"Executing: pkexec apt-get install -y {dest_file}...")
+        GLib.idle_add(lambda: self.set_progress(True, 0.95, "Installing package via pkexec (Polkit authorization)..."))
+        GLib.idle_add(lambda: self.show_toast("Installing package via pkexec (check prompt)..."))
+
+        install_deb_package(dest_file)
+        self.log("APT package installation completed successfully.")
+
+        # 7. Update status
+        new_inst = get_installed_version(app.deb_pkg, use_cache=False) or latest
+        app.installed_version = new_inst
+        app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_apps(self.apps)
+        self.log(f"Updated status for '{app.name}': Installed Version = {new_inst}")
+        return new_inst
+
     def on_update_app(self, app: AppEntry):
         """Download, verify, and install app in a background worker."""
         if self.is_busy:
@@ -669,78 +972,7 @@ class DebtainiumWindow(Adw.ApplicationWindow):
 
         def worker():
             try:
-                # 1. Fetch release
-                self.log(f"Fetching latest release metadata from GitHub...")
-                release = fetch_latest_release(app.repo)
-                latest = clean_version(release.get("tag_name", ""))
-                app.latest_version = latest
-
-                # 2. Pick asset
-                arch = get_system_arch()
-                self.log(f"Selecting matching .deb asset for architecture '{arch}'...")
-                asset = pick_release_asset(release, arch=arch, pattern=app.asset_pattern)
-                if not asset:
-                    raise DebtainiumError(f"No .deb asset matching arch '{arch}' found in release {latest}")
-
-                asset_name = asset["name"]
-                download_url = asset["browser_download_url"]
-                size_kb = asset.get("size", 0) // 1024
-
-                self.log(f"Asset matched: '{asset_name}' ({size_kb} KB)")
-                self.log(f"Download URL: {download_url}")
-
-                # 3. Download
-                repo_slug = app.repo.replace("/", "_")
-                dest_file = get_cache_dir() / repo_slug / latest / asset_name
-
-                if not dest_file.exists():
-                    self.log(f"Downloading to cache directory: {dest_file}...")
-
-                    def progress(downloaded: int, total: int):
-                        if total > 0:
-                            fraction = max(0.1, min(0.85, downloaded / total))
-                            pct = int(downloaded / total * 100)
-                            status = f"Downloading {asset_name} ({pct}% • {downloaded // 1024}/{total // 1024} KB)..."
-                            GLib.idle_add(lambda f=fraction, s=status: self.set_progress(True, f, s))
-
-                    download_asset_file(download_url, dest_file, progress)
-                    self.log("Asset download completed successfully.")
-                else:
-                    self.log(f"Using existing cached asset: {dest_file}")
-
-                # 4. SHA-256 verification
-                self.log("Searching release for SHA-256 digest verification...")
-                expected_hash = extract_sha256_digest(release, asset_name)
-                if expected_hash:
-                    self.log(f"Found expected SHA-256 digest: {expected_hash}")
-                    GLib.idle_add(lambda: self.set_progress(True, 0.9, "Verifying SHA-256 checksum..."))
-                    if not verify_file_sha256(dest_file, expected_hash):
-                        dest_file.unlink(missing_ok=True)
-                        raise ChecksumMismatchError(f"SHA-256 digest verification failed for {asset_name}!")
-                    self.log("Cryptographic SHA-256 integrity verified successfully.")
-                else:
-                    self.log("Notice: No SHA-256 digest provided in release; skipping checksum verification.")
-
-                # 5. Inspect deb package
-                info = inspect_deb(dest_file)
-                if info.get("Package"):
-                    app.deb_pkg = info["Package"]
-                    self.log(f"Debian package name confirmed from deb control: '{app.deb_pkg}'")
-
-                # 6. Install via pkexec apt-get
-                self.log(f"Executing: pkexec apt-get install -y ./{dest_file.name}...")
-                GLib.idle_add(lambda: self.set_progress(True, 0.95, "Installing package via pkexec (Polkit authorization)..."))
-                GLib.idle_add(lambda: self.show_toast("Installing package via pkexec (check prompt)..."))
-
-                install_deb_package(dest_file)
-                self.log(f"APT package installation completed successfully.")
-
-                # 7. Update status
-                new_inst = get_installed_version(app.deb_pkg) or latest
-                app.installed_version = new_inst
-                app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                save_apps(self.apps)
-                self.log(f"Updated status for '{app.name}': Installed Version = {new_inst}")
+                new_inst = self._install_latest(app)
 
                 def success_ui():
                     self.set_progress(False)
@@ -761,6 +993,193 @@ class DebtainiumWindow(Adw.ApplicationWindow):
                 GLib.idle_add(err_ui)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def on_update_all_clicked(self, _btn):
+        """Check every tracked app, then install each available update in turn."""
+        if self.is_busy or not self.apps:
+            return
+        self.is_busy = True
+        self.set_progress(True, 0.02, "Checking all applications for updates...")
+        self.log(f"=== Update All: checking {len(self.apps)} application(s) ===")
+
+        def worker():
+            apps = list(self.apps)
+            total = len(apps)
+            pending: List[AppEntry] = []
+            failed: List[str] = []
+
+            # Phase 1 — find out what actually needs installing
+            for idx, app in enumerate(apps):
+                frac = 0.02 + 0.18 * ((idx + 1) / total)
+                GLib.idle_add(
+                    lambda f=frac, a=app, i=idx, t=total: self.set_progress(
+                        True, f, f"Checking {a.name} ({i + 1}/{t})..."
+                    )
+                )
+                try:
+                    release = fetch_latest_release(app.repo)
+                    latest = clean_version(release.get("tag_name", ""))
+                    app.latest_version = latest
+                    app.last_checked = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    inst = get_installed_version(app.deb_pkg) or ""
+                    app.installed_version = inst
+                    if is_update_available(inst, latest):
+                        pending.append(app)
+                        self.log(f"• {app.name}: {inst or 'not installed'} -> {latest}")
+                except Exception as e:
+                    failed.append(f"{app.name} (check: {e})")
+                    self.log(f"• {app.name}: check failed — {e}")
+
+            save_apps(self.apps)
+            if not pending:
+                self.log("Update All: nothing to install.")
+
+                def nothing_ui():
+                    self.set_progress(False)
+                    self.refresh_list_ui()
+                    self.is_busy = False
+                    self.show_toast("All applications are up to date.")
+
+                GLib.idle_add(nothing_ui)
+                return
+
+            # Phase 2 — install them one after another
+            self.log(f"Update All: installing {len(pending)} update(s)...")
+            installed = 0
+            for pos, app in enumerate(pending, start=1):
+                frac = 0.2 + 0.8 * ((pos - 1) / len(pending))
+                GLib.idle_add(
+                    lambda f=frac, a=app, i=pos, t=len(pending): self.set_progress(
+                        True, f, f"Installing {a.name} ({i}/{t})..."
+                    )
+                )
+                self.log(f"--- [{pos}/{len(pending)}] {app.name} ---")
+                try:
+                    new_inst = self._install_latest(app)
+                    installed += 1
+                    self.log(f"--- {app.name} installed ({new_inst}) ---")
+                except Exception as e:
+                    failed.append(f"{app.name} (install: {e})")
+                    self.log(f"ERROR: {app.name} failed to install: {e}")
+
+            save_apps(self.apps)
+
+            def done_ui():
+                self.set_progress(False)
+                self.refresh_list_ui()
+                self.is_busy = False
+                summary = f"Update All: {installed} installed"
+                if failed:
+                    summary += f", {len(failed)} failed"
+                    self.log("Update All failures: " + "; ".join(failed))
+                self.show_toast(summary, timeout=6)
+
+            GLib.idle_add(done_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+class ReleaseNotesDialog(Adw.Window):
+    """Show the latest release's notes inside the app, fetched on demand."""
+
+    def __init__(self, parent_window: DebtainiumWindow, app: AppEntry):
+        super().__init__(
+            transient_for=parent_window,
+            modal=True,
+            title=f"{app.name} — Release Notes",
+        )
+        self.parent_win = parent_window
+        self.app_entry = app
+        self.set_default_size(640, 520)
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_content(toolbar_view)
+
+        header = Adw.HeaderBar()
+        header.set_show_title(True)
+        toolbar_view.add_top_bar(header)
+
+        # Placeholder while the network request is in flight
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        toolbar_view.set_content(self.stack)
+
+        spinner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        spinner_box.set_valign(Gtk.Align.CENTER)
+        spinner_box.set_halign(Gtk.Align.CENTER)
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(32, 32)
+        spinner.start()
+        spinner_box.append(spinner)
+        spinner_box.append(Gtk.Label(label="Fetching release notes…"))
+        self.stack.add_named(spinner_box, "loading")
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_margin_top(12)
+        scrolled.set_margin_bottom(12)
+        scrolled.set_margin_start(16)
+        scrolled.set_margin_end(16)
+
+        self.body_view = Gtk.TextView()
+        self.body_view.set_editable(False)
+        self.body_view.set_cursor_visible(False)
+        self.body_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.body_view.set_left_margin(4)
+        self.body_view.set_right_margin(4)
+        # Keep the markdown verbatim: GitHub's rendering is not available here.
+        self.body_view.add_css_class("monospace")
+        scrolled.set_child(self.body_view)
+        self.stack.add_named(scrolled, "notes")
+
+        error_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        error_box.set_valign(Gtk.Align.CENTER)
+        error_box.set_halign(Gtk.Align.CENTER)
+        error_box.set_margin_start(24)
+        error_box.set_margin_end(24)
+        self.error_label = Gtk.Label()
+        self.error_label.set_wrap(True)
+        self.error_label.set_justify(Gtk.Justification.CENTER)
+        error_box.append(self.error_label)
+        open_btn = Gtk.Button(label="Open on GitHub")
+        open_btn.add_css_class("pill")
+        open_btn.set_halign(Gtk.Align.CENTER)
+        open_btn.connect(
+            "clicked",
+            lambda _b: self.parent_win.open_url(
+                f"https://github.com/{app.repo}/releases/latest"
+            ),
+        )
+        error_box.append(open_btn)
+        self.stack.add_named(error_box, "error")
+
+        self.stack.set_visible_child_name("loading")
+        threading.Thread(target=self._fetch, daemon=True).start()
+
+    def _fetch(self):
+        try:
+            release = fetch_latest_release(self.app_entry.repo)
+            tag = release.get("tag_name", "") or "(unknown tag)"
+            name = release.get("name") or tag
+            body = (release.get("body") or "").strip()
+            published = (release.get("published_at") or "")[:10]
+            header = f"{name}\n{tag}"
+            if published:
+                header += f"  •  {published}"
+            text = header + "\n\n" + (body or "This release has no notes.")
+            GLib.idle_add(self._show_text, text)
+        except Exception as e:
+            GLib.idle_add(self._show_error, str(e))
+
+    def _show_text(self, text: str):
+        self.body_view.get_buffer().set_text(text)
+        self.stack.set_visible_child_name("notes")
+        return False
+
+    def _show_error(self, message: str):
+        self.error_label.set_text(f"Could not fetch release notes:\n{message}")
+        self.stack.set_visible_child_name("error")
+        return False
 
 
 class VerboseAddAppDialog(Adw.Window):
@@ -838,6 +1257,10 @@ class VerboseAddAppDialog(Adw.Window):
 
         self.pattern_entry = Adw.EntryRow(title="Asset Regex Filter (optional)")
         group_adv.add(self.pattern_entry)
+
+        self.auto_row = Adw.SwitchRow(title="Install updates automatically")
+        self.auto_row.set_subtitle("Include this app in `debtainium update --auto`")
+        group_adv.add(self.auto_row)
 
         page.add(group_adv)
 
@@ -924,6 +1347,7 @@ class VerboseAddAppDialog(Adw.Window):
                 installed_version=inst,
                 latest_version=latest,
                 last_checked=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                auto_update=self.auto_row.get_active(),
             )
 
             def update_ui():

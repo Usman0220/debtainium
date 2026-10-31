@@ -1,6 +1,6 @@
 [Unit]
 Description=Debtainium periodic update check timer (every 6 hours)
-Documentation=https://github.com/debtainium/debtainium
+Documentation=https://github.com/Usman0220/debtainium
 
 [Timer]
 OnBootSec=10min

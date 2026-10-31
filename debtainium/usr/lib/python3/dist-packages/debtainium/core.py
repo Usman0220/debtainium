@@ -6,6 +6,7 @@ asset matching, SHA-256 verification, dpkg version comparisons, and APT installa
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,10 +24,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-APP_VERSION = "1.0.1"
-CONFIG_DIR = Path.home() / ".config" / "debtainium"
+APP_VERSION = "1.1.0"
+CONFIG_DIR = Path(
+    os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+) / "debtainium"
 CONFIG_FILE = CONFIG_DIR / "apps.json"
-CACHE_DIR = Path.home() / ".cache" / "debtainium"
+CACHE_DIR = Path(
+    os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+) / "debtainium"
+TOKEN_FILE = CONFIG_DIR / "token"
+
+# dpkg-query memoisation: (monotonic timestamp, version-or-None)
+_VERSION_CACHE_TTL = 3.0
+_version_cache: Dict[str, Tuple[float, Optional[str]]] = {}
 
 DEFAULT_APPS = [
     {
@@ -33,8 +44,8 @@ DEFAULT_APPS = [
         "repo": "Usman0220/debtainium",
         "deb_pkg": "debtainium",
         "asset_pattern": r"debtainium.*all\.deb",
-        "installed_version": "1.0.1",
-        "latest_version": "1.0.1",
+        "installed_version": "1.1.0",
+        "latest_version": "1.1.0",
         "last_checked": "",
     }
 ]
@@ -69,6 +80,7 @@ class AppEntry:
     installed_version: str = ""
     latest_version: str = ""
     last_checked: str = ""
+    auto_update: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -83,6 +95,7 @@ class AppEntry:
             installed_version=data.get("installed_version", ""),
             latest_version=data.get("latest_version", ""),
             last_checked=data.get("last_checked", ""),
+            auto_update=bool(data.get("auto_update", False)),
         )
 
 
@@ -96,6 +109,23 @@ def get_cache_dir() -> Path:
     """Return the download cache directory and ensure it exists."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return CACHE_DIR
+
+
+def _corrupt_config_backup() -> Optional[Path]:
+    """
+    Copy an unparseable apps.json aside so a later save cannot destroy it.
+    Returns the backup path, or None when there is nothing to preserve.
+    """
+    if not CONFIG_FILE.exists():
+        return None
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = CONFIG_FILE.with_name(f"apps.json.corrupt-{stamp}")
+    try:
+        shutil.copy2(CONFIG_FILE, dest)
+        return dest
+    except OSError as e:
+        sys.stderr.write(f"Warning: could not back up {CONFIG_FILE}: {e}\n")
+        return None
 
 
 def load_apps() -> List[AppEntry]:
@@ -112,13 +142,22 @@ def load_apps() -> List[AppEntry]:
             apps_list = data.get("apps", [])
             return [AppEntry.from_dict(item) for item in apps_list]
     except Exception as e:
+        backup = _corrupt_config_backup()
         sys.stderr.write(f"Warning: Failed to parse {CONFIG_FILE}: {e}\n")
+        if backup:
+            sys.stderr.write(f"Warning: Your previous configuration was preserved at {backup}\n")
         return []
 
 
 def save_apps_raw(data: Dict[str, Any]) -> None:
-    """Save raw dict to apps.json atomically."""
+    """Save raw dict to apps.json atomically, keeping the previous file as .bak."""
     get_config_dir()
+    if CONFIG_FILE.exists():
+        try:
+            shutil.copy2(CONFIG_FILE, CONFIG_FILE.with_name("apps.json.bak"))
+        except OSError:
+            pass  # a missing backup is never worth failing a save over
+
     tmp_file = CONFIG_DIR / f"apps.json.tmp.{os.getpid()}"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -130,6 +169,52 @@ def save_apps_raw(data: Dict[str, Any]) -> None:
 def save_apps(apps: List[AppEntry]) -> None:
     """Save list of AppEntry objects to apps.json."""
     save_apps_raw({"apps": [app.to_dict() for app in apps]})
+
+
+def export_apps(apps: List[AppEntry]) -> Dict[str, Any]:
+    """Build a portable snapshot of the tracked apps for `debtainium export`."""
+    return {
+        "format": 1,
+        "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "app_version": APP_VERSION,
+        "apps": [app.to_dict() for app in apps],
+    }
+
+
+def merge_imported_apps(
+    existing: List[AppEntry],
+    imported: List[AppEntry],
+    replace: bool = False,
+) -> Tuple[List[AppEntry], int, int]:
+    """
+    Merge imported entries into the current list, keyed on repository.
+
+    Returns (apps, added_count, updated_count). In replace mode the imported
+    list wins entirely. Entries are matched case-insensitively on `repo` so an
+    export from another machine round-trips without duplicates.
+    """
+    if replace:
+        return list(imported), len(imported), 0
+
+    by_repo = {a.repo.lower(): a for a in existing}
+    added = updated = 0
+    for entry in imported:
+        key = entry.repo.lower()
+        if key in by_repo:
+            current = by_repo[key]
+            changed = False
+            for field in ("name", "deb_pkg", "asset_pattern", "auto_update"):
+                if getattr(entry, field):
+                    if getattr(current, field) != getattr(entry, field):
+                        setattr(current, field, getattr(entry, field))
+                        changed = True
+            if changed:
+                updated += 1
+        else:
+            existing.append(entry)
+            by_repo[key] = entry
+            added += 1
+    return existing, added, updated
 
 
 def normalize_repo(repo_input: str) -> str:
@@ -180,26 +265,44 @@ def get_system_arch() -> str:
     return mapping.get(mach, mach)
 
 
-def get_installed_version(package_name: str) -> Optional[str]:
+def get_installed_version(package_name: str, use_cache: bool = True) -> Optional[str]:
     """
     Query the installed package version using dpkg-query.
     Returns the version string or None if not installed.
+
+    Results are memoised for a few seconds: a single GUI redraw asks for every
+    tracked app (twice), and spawning one dpkg-query per row per keystroke is
+    the main cause of UI lag with a long list.
     """
     if not package_name:
         return None
+    now = time.monotonic()
+    if use_cache:
+        cached = _version_cache.get(package_name)
+        if cached is not None and now - cached[0] < _VERSION_CACHE_TTL:
+            return cached[1]
     try:
         res = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Version}", package_name],
+            ["dpkg-query", "-W", "-f=${Version}", "--", package_name],
             capture_output=True,
             text=True,
             check=False,
         )
-        if res.returncode == 0:
-            version = res.stdout.strip()
-            return version if version else None
-        return None
+        version = res.stdout.strip() if res.returncode == 0 else ""
+        result = version or None
     except Exception:
-        return None
+        result = None
+    if use_cache:
+        _version_cache[package_name] = (now, result)
+    return result
+
+
+def invalidate_version_cache(package_name: Optional[str] = None) -> None:
+    """Drop memoised dpkg versions after an install/remove changed them."""
+    if package_name is None:
+        _version_cache.clear()
+    else:
+        _version_cache.pop(package_name, None)
 
 
 def clean_version(version_str: str) -> str:
@@ -245,17 +348,44 @@ def is_update_available(installed_ver: Optional[str], latest_ver: Optional[str])
     return compare_versions(installed_ver, "lt", latest_ver)
 
 
+def get_github_token() -> Optional[str]:
+    """
+    Resolve a GitHub token from GITHUB_TOKEN, GH_TOKEN, or
+    ~/.config/debtainium/token (in that order).
+
+    The file form is what makes private repositories and CI use practical;
+    it is warned about when group/other readable.
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    try:
+        if not TOKEN_FILE.is_file():
+            return None
+        mode = TOKEN_FILE.stat().st_mode & 0o777
+        if mode & 0o077:
+            sys.stderr.write(
+                f"Warning: {TOKEN_FILE} is readable by other users "
+                f"(mode {mode:03o}); run: chmod 600 {TOKEN_FILE}\n"
+            )
+        value = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
 def get_github_request(url: str) -> urllib.request.Request:
     """
-    Build a urllib.request.Request with standard headers and GITHUB_TOKEN support.
+    Build a urllib.request.Request with standard headers and token support.
     """
     headers = {
         "User-Agent": f"Debtainium/{APP_VERSION}",
         "Accept": "application/vnd.github.v3+json",
     }
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token = get_github_token()
     if token:
-        headers["Authorization"] = f"Bearer {token.strip()}"
+        headers["Authorization"] = f"Bearer {token}"
     return urllib.request.Request(url, headers=headers)
 
 
@@ -527,6 +657,7 @@ def install_deb_package(deb_path: Path) -> Tuple[int, str, str]:
         if proc.returncode != 0:
             err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Exit code {proc.returncode}"
             raise InstallationError(f"APT installation failed ({err_msg})")
+        invalidate_version_cache()
         return proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError:
         raise InstallationError("pkexec is not installed on this system.")
@@ -541,7 +672,9 @@ def uninstall_deb_package(package_name: str) -> Tuple[int, str, str]:
     if not package_name:
         raise ValueError("Package name cannot be empty.")
 
-    cmd = ["pkexec", "apt-get", "remove", "-y", package_name]
+    # "--" stops apt-get from interpreting a package name that starts with "-"
+    # as an option.
+    cmd = ["pkexec", "apt-get", "remove", "-y", "--", package_name]
     try:
         proc = subprocess.run(
             cmd,
@@ -552,6 +685,7 @@ def uninstall_deb_package(package_name: str) -> Tuple[int, str, str]:
         if proc.returncode != 0:
             err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Exit code {proc.returncode}"
             raise InstallationError(f"APT removal failed ({err_msg})")
+        invalidate_version_cache(package_name)
         return proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError:
         raise InstallationError("pkexec is not installed on this system.")

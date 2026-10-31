@@ -1,0 +1,37 @@
+// Example polkit rule for UNATTENDED Debtainium installs.
+//
+// Debtainium installs packages with `pkexec apt-get install -y <file>.deb`.
+// Without a polkit rule, pkexec asks for a password through an authentication
+// agent, which nobody is there to answer inside debtainium-autoupdate.timer.
+// The result is a failed unit and nothing installed.
+//
+// This rule lets members of the "debtainium" group run apt-get through pkexec
+// with no prompt. READ THE TRADE-OFF BEFORE INSTALLING IT: membership in that
+// group is effectively equivalent to passwordless root, because apt-get can
+// install, remove, and upgrade anything on the system. Create a dedicated
+// group rather than adding yourself to an existing powerful one, and use it
+// only on a machine where you accept that.
+//
+// Install:
+//   sudo groupadd --system debtainium
+//   sudo usermod -aG debtainium "$USER"       # log out and back in afterwards
+//   sudo install -m 0644 \
+//        /usr/share/doc/debtainium/examples/49-debtainium-autoupdate.rules \
+//        /etc/polkit-1/rules.d/49-debtainium-autoupdate.rules
+//   systemctl --user enable --now debtainium-autoupdate.timer
+//
+// Remove the rule and run `systemctl --user disable --now
+// debtainium-autoupdate.timer` to go back to prompting.
+
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.policykit.exec") {
+        return null;
+    }
+    if (action.lookup("program") !== "/usr/bin/apt-get") {
+        return null;
+    }
+    if (!subject.isInGroup("debtainium")) {
+        return null;
+    }
+    return polkit.Result.YES;
+});

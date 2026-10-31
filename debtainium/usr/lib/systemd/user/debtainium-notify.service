@@ -1,6 +1,6 @@
 [Unit]
 Description=Debtainium background update check and notification
-Documentation=https://github.com/debtainium/debtainium
+Documentation=https://github.com/Usman0220/debtainium
 After=network-online.target
 Wants=network-online.target
 

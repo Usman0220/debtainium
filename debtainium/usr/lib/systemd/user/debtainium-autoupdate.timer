@@ -1,0 +1,11 @@
+[Unit]
+Description=Debtainium daily installation of flagged updates
+Documentation=https://github.com/Usman0220/debtainium
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

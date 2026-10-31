@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="${SCRIPT_DIR}/debtainium"
-OUTPUT_DEB="${SCRIPT_DIR}/debtainium_1.0.1_all.deb"
+OUTPUT_DEB="${SCRIPT_DIR}/debtainium_1.1.0_all.deb"
 
 echo "=========================================================="
-echo " Building Debtainium Debian Package: debtainium_1.0.1_all.deb"
+echo " Building Debtainium Debian Package: debtainium_1.1.0_all.deb"
 echo "=========================================================="
 
 # Ensure changelog is compressed with gzip -9n
@@ -30,6 +30,20 @@ find "${PKG_DIR}" -type f -exec chmod 644 {} +
 chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 chmod 755 "${PKG_DIR}/DEBIAN/prerm"
 chmod 755 "${PKG_DIR}/usr/bin/debtainium"
+
+if command -v appstreamcli >/dev/null 2>&1; then
+    echo "--> Validating AppStream metadata..."
+    appstreamcli validate --no-net "${PKG_DIR}/usr/share/metainfo/org.debtainium.Debtainium.metainfo.xml" || true
+else
+    echo "--> appstreamcli not installed; skipping AppStream validation."
+fi
+
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    echo "--> Validating desktop entry..."
+    desktop-file-validate "${PKG_DIR}/usr/share/applications/debtainium.desktop" || true
+else
+    echo "--> desktop-file-validate not installed; skipping desktop entry validation."
+fi
 
 echo "--> Packaging with dpkg-deb --build --root-owner-group..."
 dpkg-deb --build --root-owner-group "${PKG_DIR}" "${OUTPUT_DEB}"

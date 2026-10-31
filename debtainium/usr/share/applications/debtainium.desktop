@@ -9,3 +9,6 @@ Type=Application
 Categories=System;PackageManager;GTK;
 Keywords=deb;package;update;github;obtainium;installer;
 StartupNotify=true
+StartupWMClass=debtainium
+X-GNOME-UsesNotifications=true
+X-GNOME-SingleWindow=true

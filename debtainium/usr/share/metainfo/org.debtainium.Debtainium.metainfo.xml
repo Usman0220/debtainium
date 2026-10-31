@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.debtainium.Debtainium</id>
+
+  <name>Debtainium</name>
+  <summary>Install and update third-party .deb packages from GitHub Releases</summary>
+
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      Debtainium tracks third-party software that is distributed as Debian
+      packages through GitHub Releases. It knows which repository publishes
+      which package, checks for new releases, picks the .deb that matches your
+      CPU architecture, verifies its SHA-256 digest, and installs it through
+      polkit and apt.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Track any GitHub repository that publishes .deb assets</li>
+      <li>Architecture-aware asset selection with optional per-app regex filters</li>
+      <li>SHA-256 verification before anything is installed</li>
+      <li>Automatic installation policy per application, plus Update All</li>
+      <li>Import and export of the tracked list as portable JSON</li>
+      <li>Background update checks through a systemd user timer</li>
+      <li>Full command-line interface for scripting and headless machines</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">debtainium.desktop</launchable>
+
+  <url type="homepage">https://github.com/Usman0220/debtainium</url>
+  <url type="bugtracker">https://github.com/Usman0220/debtainium/issues</url>
+  <url type="vcs-browser">https://github.com/Usman0220/debtainium</url>
+
+  <developer id="org.debtainium">
+    <name>Debtainium Developers</name>
+  </developer>
+
+  <categories>
+    <category>System</category>
+    <category>PackageManager</category>
+  </categories>
+
+  <keywords>
+    <keyword>deb</keyword>
+    <keyword>package</keyword>
+    <keyword>update</keyword>
+    <keyword>github</keyword>
+    <keyword>installer</keyword>
+    <keyword>obtainium</keyword>
+  </keywords>
+
+  <provides>
+    <binary>debtainium</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="1.1.0" date="2026-10-31">
+      <description>
+        <p>Automatic installation policy, Update All, JSON import/export, token file support, and a tidier interface.</p>
+        <ul>
+          <li>Per-app auto-update switch, debtainium auto, and debtainium update --auto</li>
+          <li>Update All button and debtainium update --all</li>
+          <li>debtainium export / import with merge semantics</li>
+          <li>GitHub token file support at ~/.config/debtainium/token</li>
+          <li>Release notes dialog, search filtering by status, main menu actions</li>
+          <li>XDG base-directory support, corrupt-config backups, cached version lookups</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.0.1" date="2026-10-31">
+      <description>
+        <p>Fix installing a downloaded .deb by passing apt-get an absolute path.</p>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-10-31">
+      <description>
+        <p>First release: GitHub Release tracking, SHA-256 verification, GUI and CLI.</p>
+      </description>
+    </release>
+  </releases>
+</component>
