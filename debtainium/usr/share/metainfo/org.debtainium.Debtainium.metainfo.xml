@@ -59,6 +59,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.1.1" date="2026-10-31">
+      <description>
+        <p>Interface tidy-up: the dashboard chips use plain text labels instead of emoji.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-10-31">
       <description>
         <p>Automatic installation policy, Update All, JSON import/export, token file support, and a tidier interface.</p>
