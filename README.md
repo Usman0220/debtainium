@@ -24,7 +24,7 @@
 Download the ready-to-install `.deb` package from [Releases](https://github.com/Usman0220/debtainium/releases) and install via APT:
 
 ```bash
-sudo apt install -y ./debtainium_1.0.0_all.deb
+sudo apt install -y ./debtainium_1.0.1_all.deb
 ```
 
 Enable the background 6-hour update check timer:
@@ -78,7 +78,7 @@ chmod +x build-deb.sh
 ./build-deb.sh
 ```
 
-The script sets standard Debian file and directory permissions, builds `debtainium_1.0.0_all.deb`, and validates it against `lintian`.
+The script sets standard Debian file and directory permissions, builds `debtainium_1.0.1_all.deb`, and validates it against `lintian`.
 
 ---
 

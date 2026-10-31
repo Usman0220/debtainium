@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="${SCRIPT_DIR}/debtainium"
-OUTPUT_DEB="${SCRIPT_DIR}/debtainium_1.0.0_all.deb"
+OUTPUT_DEB="${SCRIPT_DIR}/debtainium_1.0.1_all.deb"
 
 echo "=========================================================="
-echo " Building Debtainium Debian Package: debtainium_1.0.0_all.deb"
+echo " Building Debtainium Debian Package: debtainium_1.0.1_all.deb"
 echo "=========================================================="
 
 # Ensure changelog is compressed with gzip -9n

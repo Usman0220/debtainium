@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CONFIG_DIR = Path.home() / ".config" / "debtainium"
 CONFIG_FILE = CONFIG_DIR / "apps.json"
 CACHE_DIR = Path.home() / ".cache" / "debtainium"
@@ -33,8 +33,8 @@ DEFAULT_APPS = [
         "repo": "Usman0220/debtainium",
         "deb_pkg": "debtainium",
         "asset_pattern": r"debtainium.*all\.deb",
-        "installed_version": "1.0.0",
-        "latest_version": "1.0.0",
+        "installed_version": "1.0.1",
+        "latest_version": "1.0.1",
         "last_checked": "",
     }
 ]
@@ -512,12 +512,14 @@ def install_deb_package(deb_path: Path) -> Tuple[int, str, str]:
     if not deb_path.exists():
         raise FileNotFoundError(f"Package file not found: {deb_path}")
 
-    # Set cwd to package directory so ./<filename> is valid for apt-get
-    cmd = ["pkexec", "apt-get", "install", "-y", f"./{deb_path.name}"]
+    # NOTE: pkexec always runs the program in the target user's home directory
+    # (/root), ignoring the cwd we pass here, so a relative "./<filename>" would
+    # not be found ("E: Unsupported file ... given on commandline"). Always hand
+    # apt-get an absolute path.
+    cmd = ["pkexec", "apt-get", "install", "-y", str(deb_path.resolve())]
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(deb_path.parent),
             capture_output=True,
             text=True,
             check=False,
