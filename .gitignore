@@ -1,0 +1,15 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary / partial downloads
+*.part
+*.tmp
+
+# User runtime configuration & cache
+.cache/
+.config/
+
+# Package builds (published to GitHub Releases)
+debtainium_*.deb

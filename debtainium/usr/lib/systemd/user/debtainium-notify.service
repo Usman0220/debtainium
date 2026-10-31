@@ -1,0 +1,14 @@
+[Unit]
+Description=Debtainium background update check and notification
+Documentation=https://github.com/debtainium/debtainium
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/debtainium notify
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

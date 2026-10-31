@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+        fi
+
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+        fi
+
+        echo "Debtainium 1.0.0 installed successfully."
+        echo "Tip: Run 'debtainium gui' to launch the GUI or 'debtainium --help' for CLI."
+        echo "To enable background update checks (every 6 hours), run:"
+        echo "  systemctl --user enable --now debtainium-notify.timer"
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        ;;
+esac
+
+exit 0

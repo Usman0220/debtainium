@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Attempt to stop and disable the user timer for active logged-in user sessions
+        if command -v systemctl >/dev/null 2>&1; then
+            if command -v loginctl >/dev/null 2>&1; then
+                loginctl list-users --no-legend 2>/dev/null | while read -r uid user rest; do
+                    if [ -n "$user" ]; then
+                        su - "$user" -c "systemctl --user stop debtainium-notify.timer 2>/dev/null || true"
+                        su - "$user" -c "systemctl --user disable debtainium-notify.timer 2>/dev/null || true"
+                    fi
+                done
+            fi
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        ;;
+esac
+
+exit 0

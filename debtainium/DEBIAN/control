@@ -1,0 +1,16 @@
+Package: debtainium
+Version: 1.0.0
+Architecture: all
+Maintainer: Debtainium Developers <maintainers@debtainium.org>
+Section: utils
+Priority: optional
+Homepage: https://github.com/Usman0220/debtainium
+Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, pkexec | policykit-1, libnotify-bin, apt
+Description: GitHub Release .deb package installer and updater
+ Debtainium tracks third-party software distributed as Debian packages
+ (.deb) on GitHub Releases, automatically checks for updates, downloads
+ and verifies assets, and safely installs them using polkit and apt.
+ .
+ It provides both a modern GTK4/Libadwaita graphical interface and a
+ complete command-line interface, along with a systemd user timer for
+ background update notifications.

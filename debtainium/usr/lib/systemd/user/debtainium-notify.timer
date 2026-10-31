@@ -1,0 +1,11 @@
+[Unit]
+Description=Debtainium periodic update check timer (every 6 hours)
+Documentation=https://github.com/debtainium/debtainium
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
