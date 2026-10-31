@@ -15,7 +15,7 @@ case "$1" in
             appstreamcli refresh --source=os --no-net --quiet >/dev/null 2>&1 || true
         fi
 
-        echo "Debtainium 1.1.1 installed successfully."
+        echo "Debtainium 1.1.0 installed successfully."
         echo "Tip: Run 'debtainium gui' to launch the GUI or 'debtainium --help' for CLI."
         echo "To check for updates in the background (every 6 hours):"
         echo "  systemctl --user enable --now debtainium-notify.timer"

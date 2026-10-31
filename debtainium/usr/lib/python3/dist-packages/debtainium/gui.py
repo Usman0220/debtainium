@@ -159,10 +159,10 @@ class DebtainiumWindow(Adw.ApplicationWindow):
         self.summary_box.set_margin_bottom(6)
         self.summary_box.set_halign(Gtk.Align.FILL)
 
-        self.total_chip = self.create_summary_chip("Total Tracked", "0")
-        self.updates_chip = self.create_summary_chip("Updates Available", "0", accent=True)
-        self.uptodate_chip = self.create_summary_chip("Up to Date", "0", success=True)
-        self.arch_chip = self.create_summary_chip("System Arch", get_system_arch())
+        self.total_chip = self.create_summary_chip("📦 Total Tracked", "0")
+        self.updates_chip = self.create_summary_chip("🔄 Updates Available", "0", accent=True)
+        self.uptodate_chip = self.create_summary_chip("✅ Up to Date", "0", success=True)
+        self.arch_chip = self.create_summary_chip("💻 System Arch", get_system_arch())
 
         self.summary_box.append(self.total_chip["box"])
         self.summary_box.append(self.updates_chip["box"])

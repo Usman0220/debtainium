@@ -29,7 +29,7 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/Usman0220/debtainium/main/install.sh | sudo bash
 
 Options:
-  --tag <tag>       install a specific release, e.g. --tag v1.1.1
+  --tag <tag>       install a specific release, e.g. --tag v1.1.0
   --enable-timer    enable the 6-hour background update checker (runs as you)
   --dry-run         download and verify the package, then stop
   -h, --help        show this message

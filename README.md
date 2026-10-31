@@ -37,7 +37,7 @@ systemctl --user enable --now debtainium-notify.timer
    sudo apt install -y ./debtainium_*_all.deb
    ```
 
-The installer accepts `--tag v1.1.1` to pin a release, `--enable-timer` to turn the background checker on, and `--dry-run` to download and verify without installing.
+The installer accepts `--tag v1.1.0` to pin a release, `--enable-timer` to turn the background checker on, and `--dry-run` to download and verify without installing.
 
 </details>
 
